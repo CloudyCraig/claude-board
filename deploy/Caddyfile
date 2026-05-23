@@ -1,0 +1,33 @@
+# Caddy reverse proxy for Claude Board.
+#
+# Caddy auto-provisions a Let's Encrypt cert for odin.heimdallsystems.ai
+# via HTTP-01 on first start. The DNS A record must already point at
+# this host's public IP and the Cloudflare proxy must be OFF (orange
+# cloud → grey cloud) for HTTP-01 to succeed. Once issued, certs
+# renew automatically.
+#
+# If you later move to DNS-01 via Cloudflare (so the orange cloud can
+# stay on), add the cloudflare DNS module to Caddy and set
+# `tls { dns cloudflare {env.CF_API_TOKEN} }` here.
+
+{
+    # Email used for ACME registration + renewal reminders.
+    email admin@heimdallsystems.ai
+}
+
+odin.heimdallsystems.ai {
+    encode zstd gzip
+
+    # SSE needs response buffering off; reverse_proxy already passes
+    # through, but we set an explicit flush_interval for safety.
+    reverse_proxy claude-board:8200 {
+        flush_interval -1
+    }
+
+    # Lightweight logging — easier to investigate weird traffic later
+    # without pulling in a full ELK stack.
+    log {
+        output stdout
+        format console
+    }
+}

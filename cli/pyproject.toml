@@ -1,0 +1,16 @@
+[project]
+name = "claude-board"
+version = "0.1.0"
+description = "CLI that syncs Claude session manifests to a Claude Board server."
+requires-python = ">=3.9"
+dependencies = []                       # stdlib only — keeps `pipx install` painless
+
+[project.scripts]
+claude-board = "claude_board_cli.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["claude_board_cli*"]

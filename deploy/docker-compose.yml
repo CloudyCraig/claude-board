@@ -1,0 +1,54 @@
+# Production stack for Claude Board.
+#
+# Two containers:
+#   - claude-board: the FastAPI app + baked-in frontend (port 8200 internal)
+#   - caddy: reverse proxy with automatic Let's Encrypt for odin.heimdallsystems.ai
+#
+# Persistent volumes:
+#   - claude-board-data:  SQLite db + (room for future) manifest archives
+#   - caddy-data:         Let's Encrypt cert storage
+#   - caddy-config:       Caddy runtime config
+#
+# Network: the two services share a private bridge so Caddy can reach
+# the app via http://claude-board:8200 without exposing 8200 on the
+# host. Only 80/443 are published.
+
+services:
+  claude-board:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    container_name: claude-board
+    restart: unless-stopped
+    networks: [board-net]
+    volumes:
+      - claude-board-data:/var/lib/claude-board
+    expose: ["8200"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8200/healthz"]
+      interval: 30s
+      timeout: 4s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: claude-board-caddy
+    restart: unless-stopped
+    networks: [board-net]
+    depends_on: [claude-board]
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+networks:
+  board-net:
+    driver: bridge
+
+volumes:
+  claude-board-data:
+  caddy-data:
+  caddy-config:
