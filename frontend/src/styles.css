@@ -277,9 +277,41 @@ input[type="text"]:focus, input[type="url"]:focus { border-color: var(--odin); }
   transform: translate(-50%, -50%);
   box-shadow: 0 4px 30px #00000055;
   z-index: 2;
-  transition: transform 0.4s cubic-bezier(.2,.7,.2,1), border-color 0.2s;
+  /* `left`/`top` animate when auto-layout positions change, so a
+     status flip glides between rings rather than teleporting. We
+     drop the transition during drag so the card sticks to the
+     cursor with no lag. `touch-action: none` lets us own the pointer
+     stream on touchscreens / trackpads without the browser hijacking
+     for scroll. */
+  transition: left 0.4s cubic-bezier(.2,.7,.2,1),
+              top  0.4s cubic-bezier(.2,.7,.2,1),
+              border-color 0.2s, box-shadow 0.2s;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
 }
 .card:hover { border-color: var(--odin); }
+.card.dragging {
+  cursor: grabbing;
+  transition: border-color 0.2s;
+  z-index: 5;
+  box-shadow: 0 8px 40px #0008, 0 0 0 1px var(--odin);
+}
+.card.overridden {
+  /* Subtle accent on cards the user has hand-placed, so they know
+     which positions are sticky vs auto. */
+  border-color: var(--border-2);
+  box-shadow: 0 4px 30px #00000066, inset 0 0 0 1px #1b2553;
+}
+.card.overridden::after {
+  content: "·";
+  position: absolute;
+  top: 6px; right: 10px;
+  color: var(--odin-soft);
+  font-size: 18px;
+  line-height: 1;
+  opacity: 0.7;
+}
 
 .card .head {
   display: flex;
@@ -370,6 +402,35 @@ input[type="text"]:focus, input[type="url"]:focus { border-color: var(--odin); }
   font-family: ui-monospace, monospace;
   font-size: 10px;
   color: var(--text-dim);
+}
+
+/* Toolbar pinned to the top-right of the stage: refresh, last-update
+   timestamp, optional "reset layout" when the user has dragged any
+   cards. Stays clear of the banner above it via the parent layout. */
+.stage-toolbar {
+  position: absolute;
+  top: 14px;
+  right: 18px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  z-index: 6;
+}
+.stage-toolbar .meta {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.stage-toolbar button.ghost {
+  background: #0a0f2cb0;
+  backdrop-filter: blur(6px);
+  border-color: var(--border);
+  padding: 6px 12px;
+  font-size: 12px;
+}
+.stage-toolbar button.ghost:hover {
+  border-color: var(--odin);
+  color: var(--odin-soft);
 }
 
 .empty {

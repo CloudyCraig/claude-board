@@ -1,8 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { LoginPage, MyAccountPage, RegisterPage } from "./Auth";
 import { createBoard, fetchMe, listManifests, logoutUser, subscribePolling } from "./api";
 import { layout, ringFor, type LaidOutCard } from "./Layout";
-import { boardIdFromPath, forgetToken, loadToken, saveToken } from "./storage";
+import {
+  boardIdFromPath, clearLayout, forgetToken, loadLayout, loadToken,
+  saveLayout, saveToken, type LayoutOverrides,
+} from "./storage";
 import type { Manifest, StoredBoard, User } from "./types";
 
 /**
@@ -232,6 +235,13 @@ function BoardView({ boardId }: { boardId: string }): JSX.Element {
   const [board, setBoard] = useState<StoredBoard | null>(() => loadToken(boardId));
   const [manifests, setManifests] = useState<Manifest[]>([]);
   const [err, setErr] = useState<string>("");
+  const [lastRefreshed, setLastRefreshed] = useState<number>(0);
+  const [refreshing, setRefreshing] = useState<boolean>(false);
+  // We hold the refresh fn in a ref so the user-triggered button
+  // and the polling timer call the same code path. The polling
+  // setter (subscribePolling) handles its own loop; the ref is for
+  // the manual button.
+  const refreshRef = useRef<() => Promise<void>>(async () => {});
 
   useEffect(() => {
     if (!board) return;
@@ -239,15 +249,20 @@ function BoardView({ boardId }: { boardId: string }): JSX.Element {
 
     const refresh = async (): Promise<void> => {
       try {
+        setRefreshing(true);
         const data = await listManifests(board.token);
         if (!stopped) {
           setManifests(data.items);
+          setLastRefreshed(Date.now());
           setErr("");
         }
       } catch (e) {
         if (!stopped) setErr((e as Error).message);
+      } finally {
+        if (!stopped) setRefreshing(false);
       }
     };
+    refreshRef.current = refresh;
 
     const unsub = subscribePolling(board.token, refresh, 5000);
     return () => { stopped = true; unsub(); };
@@ -272,7 +287,15 @@ function BoardView({ boardId }: { boardId: string }): JSX.Element {
     );
   }
 
-  return <Board manifests={manifests} />;
+  return (
+    <Board
+      boardId={boardId}
+      manifests={manifests}
+      onRefresh={() => refreshRef.current()}
+      refreshing={refreshing}
+      lastRefreshed={lastRefreshed}
+    />
+  );
 }
 
 function TokenPrompt({
@@ -317,9 +340,23 @@ function TokenPrompt({
 
 // ----------------- the stage -----------------
 
-function Board({ manifests }: { manifests: Manifest[] }): JSX.Element {
+function Board({
+  boardId, manifests, onRefresh, refreshing, lastRefreshed,
+}: {
+  boardId: string;
+  manifests: Manifest[];
+  onRefresh: () => void;
+  refreshing: boolean;
+  lastRefreshed: number;
+}): JSX.Element {
   const stageRef = useRef<HTMLDivElement>(null);
   const [dims, setDims] = useState<{ w: number; h: number }>({ w: 1200, h: 700 });
+
+  // Per-board persistent drag overrides. Override map is session_id
+  // → {x, y} in absolute stage-pixel coordinates of the card centre.
+  const [overrides, setOverrides] = useState<LayoutOverrides>(
+    () => loadLayout(boardId),
+  );
 
   // The stage resize tracks the container so the polar layout
   // expands and contracts gracefully. ResizeObserver fires once on
@@ -334,25 +371,52 @@ function Board({ manifests }: { manifests: Manifest[] }): JSX.Element {
     return () => ro.disconnect();
   }, []);
 
-  // Stable ordering before layout so the per-ring index doesn't jump
-  // around when a card moves rings. Sort by session_id alphabetically.
-  const sorted = useMemo(
-    () => [...manifests].sort((a, b) => a.session_id.localeCompare(b.session_id)),
-    [manifests],
-  );
-  const placed = useMemo(() => layout(sorted, dims.w, dims.h), [sorted, dims]);
+  // Stable auto-layout. Drag overrides apply on top.
+  const placed = useMemo(() => layout(manifests, dims.w, dims.h), [manifests, dims]);
 
-  // Build an index from session_id → position so we can draw edges.
+  // Merge auto-layout with overrides. We don't mutate `placed` — we
+  // produce a fresh array because rendering cares about identity.
+  const positioned = useMemo<LaidOutCard[]>(
+    () => placed.map((c) => {
+      const o = overrides[c.manifest.session_id];
+      return o ? { ...c, x: o.x, y: o.y } : c;
+    }),
+    [placed, overrides],
+  );
+
+  // Build an index from session_id → position so we can draw edges
+  // that follow dragged cards.
   const positionsBySession = useMemo(() => {
     const m = new Map<string, LaidOutCard>();
-    for (const p of placed) m.set(p.manifest.session_id, p);
+    for (const p of positioned) m.set(p.manifest.session_id, p);
     return m;
-  }, [placed]);
+  }, [positioned]);
+
+  // Persisted callback so SessionCard doesn't re-mount drag handlers
+  // every render.
+  const commitDrag = useCallback((sessionId: string, x: number, y: number) => {
+    setOverrides((prev) => {
+      const next = { ...prev, [sessionId]: { x, y } };
+      saveLayout(boardId, next);
+      return next;
+    });
+  }, [boardId]);
+
+  const resetLayout = useCallback(() => {
+    clearLayout(boardId);
+    setOverrides({});
+  }, [boardId]);
+
+  const hasOverrides = Object.keys(overrides).length > 0;
 
   if (manifests.length === 0) {
     return (
       <main className="board">
         <div className="stage" ref={stageRef}>
+          <StageToolbar
+            onRefresh={onRefresh} refreshing={refreshing} lastRefreshed={lastRefreshed}
+            onResetLayout={resetLayout} hasOverrides={hasOverrides}
+          />
           <div className="odin-centre">
             <img src="/odin.png" alt="Odin" />
             <div className="label">no sessions yet · push a manifest to begin</div>
@@ -365,6 +429,10 @@ function Board({ manifests }: { manifests: Manifest[] }): JSX.Element {
   return (
     <main className="board">
       <div className="stage" ref={stageRef}>
+        <StageToolbar
+          onRefresh={onRefresh} refreshing={refreshing} lastRefreshed={lastRefreshed}
+          onResetLayout={resetLayout} hasOverrides={hasOverrides}
+        />
         <div className="odin-centre">
           <img src="/odin.png" alt="Odin" />
           <div className="label">heimdall stands the watch</div>
@@ -372,7 +440,7 @@ function Board({ manifests }: { manifests: Manifest[] }): JSX.Element {
 
         {/* Dependency edges live on an SVG behind the cards. */}
         <svg className="edges" width={dims.w} height={dims.h}>
-          {placed.flatMap((p) =>
+          {positioned.flatMap((p) =>
             (p.manifest.depends_on ?? []).map((dep, i) => {
               const other = positionsBySession.get(dep);
               if (!other) return null;
@@ -389,16 +457,139 @@ function Board({ manifests }: { manifests: Manifest[] }): JSX.Element {
           )}
         </svg>
 
-        {placed.map((p) => (
-          <SessionCard key={p.manifest.session_id} card={p} />
+        {positioned.map((p) => (
+          <SessionCard
+            key={p.manifest.session_id}
+            card={p}
+            stageRef={stageRef}
+            overridden={!!overrides[p.manifest.session_id]}
+            onDragEnd={(x, y) => commitDrag(p.manifest.session_id, x, y)}
+          />
         ))}
       </div>
     </main>
   );
 }
 
-function SessionCard({ card }: { card: LaidOutCard }): JSX.Element {
+// ----------------- toolbar (refresh + reset layout) -----------------
+
+function StageToolbar({
+  onRefresh, refreshing, lastRefreshed, onResetLayout, hasOverrides,
+}: {
+  onRefresh: () => void;
+  refreshing: boolean;
+  lastRefreshed: number;
+  onResetLayout: () => void;
+  hasOverrides: boolean;
+}): JSX.Element {
+  // Force a re-render once a minute so the "Xs ago" stamp stays fresh
+  // even when nothing else changes.
+  const [, force] = useState(0);
+  useEffect(() => {
+    const id = window.setInterval(() => force((n) => n + 1), 30_000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const ago = lastRefreshed
+    ? `updated ${relativeTime(new Date(lastRefreshed).toISOString())}`
+    : "—";
+
+  return (
+    <div className="stage-toolbar">
+      <span className="meta">{ago}</span>
+      <button
+        className="ghost"
+        onClick={onRefresh}
+        disabled={refreshing}
+        title="Refresh manifests (also polls automatically every 5 s)"
+      >
+        {refreshing ? "refreshing…" : "↻ refresh"}
+      </button>
+      {hasOverrides ? (
+        <button
+          className="ghost"
+          onClick={onResetLayout}
+          title="Snap every card back to its auto-layout position"
+        >
+          reset layout
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+// ----------------- card (with drag) -----------------
+
+function SessionCard({
+  card, stageRef, overridden, onDragEnd,
+}: {
+  card: LaidOutCard;
+  stageRef: React.RefObject<HTMLDivElement>;
+  overridden: boolean;
+  onDragEnd: (x: number, y: number) => void;
+}): JSX.Element {
   const m = card.manifest;
+  const cardRef = useRef<HTMLDivElement>(null);
+
+  // Drag state. We use pointer events so this works on touch + mouse
+  // out of the box, including the trackpad on the Heimdall Claude
+  // Control desktop window.
+  //
+  // Position-during-drag is kept in component state (so motion is
+  // smooth) and only committed to the parent on pointerup (so we
+  // don't thrash localStorage on every pixel).
+  const [dragPos, setDragPos] = useState<{ x: number; y: number } | null>(null);
+  const dragOffset = useRef<{ dx: number; dy: number } | null>(null);
+
+  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>): void => {
+    // Only respond to primary button; ignore right-click etc.
+    if (e.button !== 0) return;
+    const el = cardRef.current;
+    const stage = stageRef.current;
+    if (!el || !stage) return;
+    const stageBox = stage.getBoundingClientRect();
+    // Centre of the card relative to the stage.
+    const cx = e.clientX - stageBox.left;
+    const cy = e.clientY - stageBox.top;
+    dragOffset.current = { dx: cx - card.x, dy: cy - card.y };
+    el.setPointerCapture(e.pointerId);
+    setDragPos({ x: card.x, y: card.y });
+    e.preventDefault();
+  };
+
+  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>): void => {
+    if (!dragOffset.current) return;
+    const stage = stageRef.current;
+    if (!stage) return;
+    const stageBox = stage.getBoundingClientRect();
+    const cx = e.clientX - stageBox.left;
+    const cy = e.clientY - stageBox.top;
+    // Half-card padding so a card can't drift fully off the stage.
+    const padX = 140 + 6;
+    const padY = 85 + 6;
+    const x = Math.max(padX, Math.min(stage.clientWidth  - padX, cx - dragOffset.current.dx));
+    const y = Math.max(padY, Math.min(stage.clientHeight - padY, cy - dragOffset.current.dy));
+    setDragPos({ x, y });
+  };
+
+  const onPointerUp = (e: React.PointerEvent<HTMLDivElement>): void => {
+    if (!dragOffset.current || !dragPos) return;
+    const el = cardRef.current;
+    if (el && el.hasPointerCapture(e.pointerId)) {
+      el.releasePointerCapture(e.pointerId);
+    }
+    dragOffset.current = null;
+    onDragEnd(dragPos.x, dragPos.y);
+    setDragPos(null);
+  };
+
+  const onDoubleClick = (): void => {
+    // Convenience: double-click resets just this card (only if it
+    // has been dragged). Plain click stays free for future select-
+    // a-card affordances.
+    if (overridden) onDragEnd(card.x, card.y);   // parent will replace, but…
+  };
+
   const chipClass =
     m.blocked_on_user ? "blocked" :
     m.status === "blocked" || m.status === "idle" ? m.status :
@@ -414,10 +605,29 @@ function SessionCard({ card }: { card: LaidOutCard }): JSX.Element {
     return <span key={t.id} className={`pip ${cls}`} title={`${t.status}: ${t.title}`} />;
   });
 
+  // Position: drag-in-progress overrides everything else.
+  const x = dragPos ? dragPos.x : card.x;
+  const y = dragPos ? dragPos.y : card.y;
+  const dragging = dragPos !== null;
+
+  const cls = [
+    "card",
+    m.blocked_on_user ? "blocked-on-user" : "",
+    dragging         ? "dragging"         : "",
+    overridden       ? "overridden"       : "",
+  ].filter(Boolean).join(" ");
+
   return (
     <div
-      className={"card " + (m.blocked_on_user ? "blocked-on-user" : "")}
-      style={{ left: card.x, top: card.y }}
+      ref={cardRef}
+      className={cls}
+      style={{ left: x, top: y }}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerUp}
+      onDoubleClick={onDoubleClick}
+      title={overridden ? "Drag to move · double-click to snap back" : "Drag to move"}
     >
       <div className="head">
         <div className="title" title={m.title}>{m.title || "(untitled)"}</div>
