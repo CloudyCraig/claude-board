@@ -1,3 +1,5 @@
+name: claude-board
+
 # Production stack for Claude Board.
 #
 # Two containers:
