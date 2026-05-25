@@ -7,6 +7,12 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
     "pydantic>=2.6",
+    # Odin v2: user accounts + signed session cookies.
+    # bcrypt-only (no passlib) because we hash + verify in two lines.
+    # itsdangerous gives us tamper-evident cookie payloads with a TTL.
+    "bcrypt>=4.1",
+    "itsdangerous>=2.1",
+    "email-validator>=2.1",
 ]
 
 [build-system]

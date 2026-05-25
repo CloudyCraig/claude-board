@@ -1,0 +1,56 @@
+{
+  "name": "heimdall-claude-control",
+  "version": "0.1.0",
+  "description": "Heimdall Claude Control — desktop client for the Odin · Claude Board web app, with a one-click Claude CLI launcher for the folder of your choice.",
+  "main": "main.js",
+  "homepage": "https://odin.heimdallsystems.ai",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --mac --x64 --arm64",
+    "dist:dmg": "electron-builder --mac dmg --x64 --arm64"
+  },
+  "devDependencies": {
+    "electron": "^32.0.0",
+    "electron-builder": "^25.0.0"
+  },
+  "build": {
+    "appId": "ai.heimdallsystems.claude-control",
+    "productName": "Heimdall Claude Control",
+    "copyright": "© 2026 Heimdall Systems",
+    "directories": {
+      "output": "dist-app",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      { "from": "build/icon.png", "to": "icon.png" }
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "build/icon.icns",
+      "target": [
+        { "target": "dmg", "arch": ["universal"] }
+      ],
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "identity": null
+    },
+    "dmg": {
+      "title": "Heimdall Claude Control",
+      "background": "build/dmg-bg.png",
+      "icon": "build/icon.icns",
+      "iconSize": 120,
+      "window": { "width": 540, "height": 380 },
+      "contents": [
+        { "x": 130, "y": 200, "type": "file" },
+        { "x": 410, "y": 200, "type": "link", "path": "/Applications" }
+      ]
+    }
+  }
+}

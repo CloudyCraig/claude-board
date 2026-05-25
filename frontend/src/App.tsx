@@ -1,13 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { createBoard, listManifests, subscribePolling } from "./api";
+import { LoginPage, MyAccountPage, RegisterPage } from "./Auth";
+import { createBoard, fetchMe, listManifests, logoutUser, subscribePolling } from "./api";
 import { layout, ringFor, type LaidOutCard } from "./Layout";
 import { boardIdFromPath, forgetToken, loadToken, saveToken } from "./storage";
-import type { Manifest, StoredBoard } from "./types";
+import type { Manifest, StoredBoard, User } from "./types";
 
 /**
  * Top-level shell. URL drives mode:
  *
  *   /                    landing page (create-a-board)
+ *   /login               sign-in form (Odin v2)
+ *   /register            registration form (Odin v2)
+ *   /me                  signed-in user's boards (Odin v2)
  *   /b/<board_id>        board view (needs token in localStorage; if
  *                        missing, prompts the visitor to paste it)
  *
@@ -16,25 +20,80 @@ import type { Manifest, StoredBoard } from "./types";
  * caricature.
  */
 export function App(): JSX.Element {
-  const boardId = useMemo(() => boardIdFromPath(), []);
+  const route = useMemo(() => detectRoute(), []);
   return (
     <div className="app">
       <Banner />
-      {boardId ? <BoardView boardId={boardId} /> : <Landing />}
+      <RouteBody route={route} />
     </div>
   );
 }
 
+type Route =
+  | { kind: "landing" }
+  | { kind: "login" }
+  | { kind: "register" }
+  | { kind: "me" }
+  | { kind: "board"; boardId: string };
+
+function detectRoute(): Route {
+  const boardId = boardIdFromPath();
+  if (boardId) return { kind: "board", boardId };
+  const p = window.location.pathname.replace(/\/+$/, "");
+  if (p === "/login")    return { kind: "login" };
+  if (p === "/register") return { kind: "register" };
+  if (p === "/me")       return { kind: "me" };
+  return { kind: "landing" };
+}
+
+function RouteBody({ route }: { route: Route }): JSX.Element {
+  switch (route.kind) {
+    case "login":    return <LoginPage />;
+    case "register": return <RegisterPage />;
+    case "me":       return <MyAccountPage />;
+    case "board":    return <BoardView boardId={route.boardId} />;
+    case "landing":  return <Landing />;
+  }
+}
+
 function Banner(): JSX.Element {
+  // The banner runs a one-shot fetchMe so it can show the "Signed
+  // in as …" affordance without forcing every page to re-implement
+  // it. We treat 'undefined' as 'still loading' and don't render
+  // either affordance to avoid flicker.
+  const [me, setMe] = useState<User | null | undefined>(undefined);
+  useEffect(() => {
+    let stopped = false;
+    fetchMe().then((u) => { if (!stopped) setMe(u); }).catch(() => { /* ignore */ });
+    return () => { stopped = true; };
+  }, []);
+
+  const onLogout = async (): Promise<void> => {
+    await logoutUser();
+    window.location.assign("/");
+  };
+
   return (
     <header className="banner">
       <a className="brand" href="/">
         <img src="/odin.png" alt="Odin's silhouette" />
-        <span>Claude Board</span>
-        <span className="tagline">· the watchtower</span>
+        <span>Odin</span>
+        <span className="tagline">· Claude Board</span>
       </a>
       <div className="grow" />
-      <a className="meta" href="https://github.com/CloudyCraig/claude-board" target="_blank" rel="noreferrer">
+      {me === undefined ? null : me ? (
+        <>
+          <a className="meta" href="/me">{me.name || me.email}</a>
+          <button onClick={onLogout} style={{ marginLeft: 8 }}>sign out</button>
+        </>
+      ) : (
+        <>
+          <a className="meta" href="/login">sign in</a>
+          <a className="meta" href="/register" style={{ marginLeft: 12 }}>register</a>
+        </>
+      )}
+      <a className="meta" href="https://github.com/CloudyCraig/claude-board"
+         target="_blank" rel="noreferrer" style={{ marginLeft: 16 }}>
         self-host on GitHub
       </a>
     </header>
@@ -91,6 +150,10 @@ function Landing(): JSX.Element {
         <p style={{ color: "var(--text-mute)", marginTop: 0 }}>
           One click mints a board ID and a bearer token. Treat the token like a password —
           it's the only credential. Lose it, mint another.
+        </p>
+        <p style={{ color: "var(--text-mute)", marginTop: 0, fontSize: 13 }}>
+          Prefer to keep all your boards in one place? <a href="/register">Create an Odin
+          account</a> — boards minted while signed in are remembered in your dashboard.
         </p>
         <label htmlFor="note">Label (optional)</label>
         <input

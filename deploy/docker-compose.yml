@@ -24,6 +24,19 @@ services:
     volumes:
       - claude-board-data:/var/lib/claude-board
     expose: ["8200"]
+    environment:
+      # Required in prod — without it sessions invalidate on every
+      # container restart. Generated once and persisted in deploy/.env
+      # (see README) so a redeploy doesn't log everyone out.
+      BOARD_SESSION_SECRET: ${BOARD_SESSION_SECRET:?BOARD_SESSION_SECRET must be set — see deploy/README.md}
+      # We're behind Caddy on https — emit Secure cookies.
+      BOARD_COOKIE_SECURE:  "true"
+      # Origins allowed to call /api/auth/* with credentials. The
+      # public web is same-origin so it's covered automatically;
+      # the desktop Electron app loads odin.heimdallsystems.ai
+      # directly so its origin is also same. This var is here in
+      # case we later add a custom electron:// scheme.
+      BOARD_ALLOWED_ORIGINS: "https://odin.heimdallsystems.ai"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8200/healthz"]
       interval: 30s

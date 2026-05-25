@@ -9,6 +9,10 @@ dist/
 node_modules/
 frontend/dist/
 
+# Electron desktop app build output (100 MB+ DMGs).
+# Built artifacts ship via release page, not git.
+desktop/dist-app/
+
 # Local runtime
 *.db
 .env

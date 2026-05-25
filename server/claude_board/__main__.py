@@ -1,19 +1,34 @@
-"""Claude Board server — multi-tenant manifest store + static UI host.
+"""Odin · Claude Board server — multi-tenant manifest store + user accounts + static UI host.
 
-One central concept: the BOARD. A user visits the homepage, clicks
-"create a board", the server mints {board_id, token}. The user paste-
-configures their local Claude with those two values; from then on
-every Claude session they run writes manifests tagged with the board_id
-via `claude-board push`. The board's URL (/b/<board_id>) shows the
-user their own sessions — and only theirs, because the token is
-required to read.
+Two parallel concepts:
 
-Threat model: bearer-token like a share link. Token = full read/write
-access to that board. Lost token = mint a new board (no recovery —
-we don't have email).
+  1. **The BOARD** (original, still supported). A visitor mints a
+     board, gets {board_id, bearer_token}, pastes them into their
+     local CLAUDE.md. Every Claude session pushes manifests tagged
+     with the board_id. /b/<board_id> shows that board's sessions.
+     Auth = bearer token. No user account required. Great for the
+     "I'm just trying it out" path and for the CLI.
 
-Storage: SQLite. Two tables (boards, manifests). Plenty for the scale
-this thing operates at; trivially migratable to Postgres if it grows.
+  2. **The USER** (Odin v2, added 2026-05). Visitors (especially
+     desktop-app users) register with name + email + password and
+     an optional marketing-opt-in tickbox. A user can own zero or
+     more boards. The desktop app pre-fills registration on first
+     launch, then logs the user in with a signed session cookie.
+     Auth = session cookie. Backwards compatible: the bearer-token
+     flow still works untouched, so anyone with an existing
+     CLAUDE.md keeps pushing without re-configuring.
+
+Storage: SQLite. Tables: boards, manifests, users, sessions,
+registrations, groups, group_members. Schema is initialised at
+startup and ALTER-TABLE migrations are applied idempotently.
+
+Threat model:
+  • bearer token = full read/write access to that one board. Lose
+    it, mint another. Tokens are sha256-hashed at rest.
+  • user password is bcrypt-hashed. Session cookies are signed by
+    itsdangerous with a server-side secret (BOARD_SESSION_SECRET).
+    Without the secret the cookie can't be forged. Sessions also
+    have a server-side row so we can revoke individual sessions.
 """
 
 from __future__ import annotations
@@ -26,16 +41,19 @@ import secrets
 import sqlite3
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
+import bcrypt
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from email_validator import EmailNotValidError, validate_email
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from pydantic import BaseModel, EmailStr, Field
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +65,22 @@ LISTEN_HOST    = os.environ.get("BOARD_HOST", "0.0.0.0")
 LISTEN_PORT    = int(os.environ.get("BOARD_PORT", "8200"))
 # Sessions older than this with no updates are pruned from disk daily.
 PRUNE_AFTER_DAYS = int(os.environ.get("BOARD_PRUNE_DAYS", "60"))
+
+# Cookie session secret — used by itsdangerous to sign session-id
+# cookies. MUST be set in production via env. In dev (no env var) we
+# generate a fresh secret on each restart, which invalidates every
+# existing session — fine for dev, catastrophic for prod, so we
+# log loudly when this fallback fires.
+_SESSION_SECRET_ENV = os.environ.get("BOARD_SESSION_SECRET", "").strip()
+SESSION_SECRET      = _SESSION_SECRET_ENV or secrets.token_urlsafe(32)
+SESSION_COOKIE_NAME = "odin_session"
+SESSION_TTL_DAYS    = int(os.environ.get("BOARD_SESSION_TTL_DAYS", "30"))
+# Set to "true" once we're served over HTTPS (i.e. in prod through
+# Caddy). Local dev over http:// would silently drop a Secure cookie
+# so the default is conservative.
+COOKIE_SECURE       = os.environ.get("BOARD_COOKIE_SECURE", "false").lower() == "true"
+
+_session_signer = URLSafeTimedSerializer(SESSION_SECRET, salt="odin-session-v1")
 
 
 # ----------------- store -----------------
@@ -78,7 +112,77 @@ CREATE TABLE IF NOT EXISTS manifests (
 
 CREATE INDEX IF NOT EXISTS idx_manifests_board_updated
     ON manifests(board_id, updated_at DESC);
+
+-- Odin v2: user accounts, sessions, registration audit log.
+CREATE TABLE IF NOT EXISTS users (
+    user_id          TEXT PRIMARY KEY,
+    email            TEXT NOT NULL UNIQUE,   -- stored lower-cased
+    name             TEXT NOT NULL DEFAULT '',
+    password_hash    TEXT NOT NULL,           -- bcrypt
+    marketing_opt_in INTEGER NOT NULL DEFAULT 0,
+    created_at       TEXT NOT NULL,
+    last_seen        TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    sid           TEXT PRIMARY KEY,           -- opaque token, stored as-is
+    user_id       TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    expires_at    TEXT NOT NULL,
+    user_agent    TEXT DEFAULT '',
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+-- One row per registration event. We keep this even though the
+-- users table already has marketing_opt_in, because the question
+-- "how many people registered via the desktop app last week" needs
+-- an event log, not a snapshot.
+CREATE TABLE IF NOT EXISTS registrations (
+    registration_id  TEXT PRIMARY KEY,
+    user_id          TEXT NOT NULL,
+    source           TEXT NOT NULL DEFAULT 'web',  -- 'web' | 'desktop' | 'cli'
+    marketing_opt_in INTEGER NOT NULL DEFAULT 0,
+    created_at       TEXT NOT NULL,
+    user_agent       TEXT DEFAULT '',
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_registrations_user ON registrations(user_id);
+CREATE INDEX IF NOT EXISTS idx_registrations_source ON registrations(source, created_at);
+
+-- Groups: a user owns one or more groups, can invite other users
+-- into them. Group ownership of boards comes later — for now a
+-- group is just a named collection of user_ids.
+CREATE TABLE IF NOT EXISTS groups (
+    group_id      TEXT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    FOREIGN KEY (owner_user_id) REFERENCES users(user_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS group_members (
+    group_id    TEXT NOT NULL,
+    user_id     TEXT NOT NULL,
+    role        TEXT NOT NULL DEFAULT 'member',   -- 'owner' | 'admin' | 'member'
+    added_at    TEXT NOT NULL,
+    PRIMARY KEY (group_id, user_id)
+);
 """
+
+
+# Idempotent ALTER-TABLE migrations. SQLite's `ADD COLUMN IF NOT
+# EXISTS` is only available on 3.35+; rather than depend on it we
+# try the ADD and catch the "duplicate column" error. Each entry is
+# (sql, friendly_name) so the log message tells us what ran.
+_MIGRATIONS: list[tuple[str, str]] = [
+    (
+        "ALTER TABLE boards ADD COLUMN owner_user_id TEXT DEFAULT NULL",
+        "boards.owner_user_id",
+    ),
+]
 
 
 def _open_db() -> sqlite3.Connection:
@@ -96,6 +200,19 @@ def _open_db() -> sqlite3.Connection:
 def _init_db() -> None:
     with _open_db() as conn:
         conn.executescript(_SCHEMA_SQL)
+        for sql, name in _MIGRATIONS:
+            try:
+                conn.execute(sql)
+                logger.info("migration applied: %s", name)
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" in str(exc).lower():
+                    continue
+                raise
+    if not _SESSION_SECRET_ENV:
+        logger.warning(
+            "BOARD_SESSION_SECRET not set — sessions will invalidate on every "
+            "restart. Set this env var in production."
+        )
 
 
 def _now_iso() -> str:
@@ -144,12 +261,160 @@ async def require_board(request: Request) -> dict[str, Any]:
     return board
 
 
+# ----------------- user / session auth -----------------
+#
+# Passwords are bcrypt-hashed. Sessions are random 32-byte tokens
+# stored server-side in `sessions` and handed to the client inside an
+# itsdangerous-signed cookie. The signature prevents a tampered
+# cookie from passing the DB lookup; the server-side row lets us
+# revoke individual sessions (logout, password-change).
+
+def _hash_password(plain: str) -> str:
+    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
+
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except (ValueError, TypeError):
+        return False
+
+
+def _normalise_email(email: str) -> str:
+    """Validate + lower-case + strip. Raises HTTPException on bad input."""
+    try:
+        info = validate_email(email, check_deliverability=False)
+    except EmailNotValidError as exc:
+        raise HTTPException(status_code=400, detail=f"invalid email: {exc}") from exc
+    return info.normalized.lower()
+
+
+def _mint_session(user_id: str, user_agent: str = "") -> tuple[str, str, datetime]:
+    """Create a session row + return (raw_sid, signed_cookie, expires_at)."""
+    sid = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(days=SESSION_TTL_DAYS)
+    with _open_db() as conn:
+        conn.execute(
+            "INSERT INTO sessions (sid, user_id, created_at, expires_at, user_agent) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (sid, user_id, now.isoformat(timespec="seconds"),
+             expires.isoformat(timespec="seconds"), user_agent[:200]),
+        )
+    signed = _session_signer.dumps(sid)
+    return sid, signed, expires
+
+
+def _user_for_cookie(signed_cookie: str | None) -> Optional[dict[str, Any]]:
+    """Verify the signed cookie, look up the session, return the user
+    row. None for any failure mode (missing/bad/expired/revoked)."""
+    if not signed_cookie:
+        return None
+    try:
+        sid = _session_signer.loads(signed_cookie, max_age=SESSION_TTL_DAYS * 86400)
+    except (BadSignature, SignatureExpired):
+        return None
+    with _open_db() as conn:
+        row = conn.execute(
+            """
+            SELECT u.user_id, u.email, u.name, u.marketing_opt_in,
+                   u.created_at, u.last_seen, s.expires_at
+            FROM sessions s
+            JOIN users u ON u.user_id = s.user_id
+            WHERE s.sid = ?
+            """,
+            (sid,),
+        ).fetchone()
+        if row is None:
+            return None
+        # Reject expired rows defensively even though the signer
+        # already enforced max_age — cheap insurance.
+        try:
+            expires = datetime.fromisoformat(row["expires_at"])
+        except ValueError:
+            return None
+        if expires < datetime.now(timezone.utc):
+            conn.execute("DELETE FROM sessions WHERE sid = ?", (sid,))
+            return None
+        # Refresh last_seen so we can tell who's been around lately.
+        conn.execute("UPDATE users SET last_seen = ? WHERE user_id = ?",
+                     (_now_iso(), row["user_id"]))
+    return {
+        "user_id":          row["user_id"],
+        "email":            row["email"],
+        "name":             row["name"],
+        "marketing_opt_in": bool(row["marketing_opt_in"]),
+        "created_at":       row["created_at"],
+        "last_seen":        row["last_seen"],
+    }
+
+
+def _delete_session(signed_cookie: str | None) -> None:
+    if not signed_cookie:
+        return
+    try:
+        sid = _session_signer.loads(signed_cookie, max_age=SESSION_TTL_DAYS * 86400)
+    except (BadSignature, SignatureExpired):
+        return
+    with _open_db() as conn:
+        conn.execute("DELETE FROM sessions WHERE sid = ?", (sid,))
+
+
+async def current_user(
+    odin_session: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
+) -> Optional[dict[str, Any]]:
+    """Optional-user dependency. Returns the user dict if a valid
+    session cookie is present, else None. Use this on endpoints
+    that behave differently when logged-in vs anonymous (e.g.
+    POST /api/boards stamps owner_user_id when present)."""
+    return _user_for_cookie(odin_session)
+
+
+async def require_user(
+    odin_session: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
+) -> dict[str, Any]:
+    """Required-user dependency. 401 if no valid session."""
+    user = _user_for_cookie(odin_session)
+    if user is None:
+        raise HTTPException(status_code=401, detail="not logged in")
+    return user
+
+
+def _set_session_cookie(response: Response, signed: str, expires: datetime) -> None:
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=signed,
+        expires=expires,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="lax",
+        path="/",
+    )
+
+
+def _clear_session_cookie(response: Response) -> None:
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+
+
 # ----------------- payloads -----------------
 
 class CreateBoardPayload(BaseModel):
     # Free-form label so the user can identify their own board in the
     # UI ("craig's main", "team-eng"). Optional.
     note: str = ""
+
+
+class RegisterPayload(BaseModel):
+    name:             str
+    email:            EmailStr
+    password:         str
+    marketing_opt_in: bool = False
+    source:           str = "web"          # web | desktop | cli
+
+
+class LoginPayload(BaseModel):
+    email:    EmailStr
+    password: str
 
 
 class ManifestPayload(BaseModel):
@@ -240,14 +505,26 @@ async def _prune_loop() -> None:
 
 
 def _build_app() -> FastAPI:
-    app = FastAPI(title="Claude Board", lifespan=lifespan)
+    app = FastAPI(title="Odin · Claude Board", lifespan=lifespan)
 
-    # CORS open for now — the API is bearer-token gated, so origin
-    # doesn't add meaningful security. If we add cookies later, lock
-    # this down.
+    # CORS: the manifest endpoints are bearer-token gated so origin
+    # doesn't matter for them, but the auth endpoints set a cookie
+    # and the desktop Electron app talks to us from a file:// or
+    # custom-scheme origin. We allow_credentials=True with an
+    # explicit origin allow-list rather than "*" (you can't combine
+    # allow_credentials with wildcard origins).
+    allowed_origins = [
+        o.strip()
+        for o in os.environ.get(
+            "BOARD_ALLOWED_ORIGINS",
+            "https://odin.heimdallsystems.ai,http://localhost:5173,http://localhost:8200",
+        ).split(",")
+        if o.strip()
+    ]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=allowed_origins,
+        allow_credentials=True,
         allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
         allow_headers=["*"],
     )
@@ -257,22 +534,149 @@ def _build_app() -> FastAPI:
         return {"status": "ok", "time": _now_iso()}
 
     @app.post("/api/boards")
-    async def create_board(payload: CreateBoardPayload) -> dict[str, str]:
+    async def create_board(
+        payload: CreateBoardPayload,
+        user: dict[str, Any] | None = Depends(current_user),
+    ) -> dict[str, str]:
         """Mint a new board. Returns {board_id, token, url}. Token is
         shown ONCE — we store only the hash. Lose it and there is no
-        recovery."""
+        recovery. If the caller is logged in, the new board is
+        owned by them (shows up in GET /api/users/me/boards)."""
         board_id = "brd_" + secrets.token_urlsafe(12)
         token = secrets.token_urlsafe(32)
+        owner = user["user_id"] if user else None
         with _open_db() as conn:
             conn.execute(
-                "INSERT INTO boards (board_id, token_hash, created_at, last_seen, note) VALUES (?, ?, ?, ?, ?)",
-                (board_id, _hash_token(token), _now_iso(), _now_iso(), payload.note[:200]),
+                "INSERT INTO boards (board_id, token_hash, created_at, last_seen, note, owner_user_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (board_id, _hash_token(token), _now_iso(), _now_iso(),
+                 payload.note[:200], owner),
             )
         return {
             "board_id": board_id,
             "token":    token,
             "url":      f"/b/{board_id}",
             "note":     "Save this token now — it's shown only once.",
+        }
+
+    # ----------------- auth endpoints -----------------
+
+    @app.post("/api/auth/register")
+    async def register(
+        payload: RegisterPayload,
+        request: Request,
+        response: Response,
+    ) -> dict[str, Any]:
+        """Create a user, log them in (set session cookie), and write
+        a row to the registrations audit log. Idempotent only by
+        accident — a second register with the same email returns 409."""
+        email = _normalise_email(payload.email)
+        if len(payload.password) < 8:
+            raise HTTPException(status_code=400,
+                                detail="password must be at least 8 characters")
+        if len(payload.name.strip()) == 0:
+            raise HTTPException(status_code=400, detail="name is required")
+        source = payload.source.strip().lower() or "web"
+        if source not in {"web", "desktop", "cli"}:
+            source = "web"
+        user_id = "usr_" + secrets.token_urlsafe(12)
+        ua = request.headers.get("user-agent", "")[:200]
+        try:
+            with _open_db() as conn:
+                conn.execute(
+                    "INSERT INTO users (user_id, email, name, password_hash, "
+                    "marketing_opt_in, created_at, last_seen) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (user_id, email, payload.name.strip()[:120],
+                     _hash_password(payload.password),
+                     int(payload.marketing_opt_in),
+                     _now_iso(), _now_iso()),
+                )
+                conn.execute(
+                    "INSERT INTO registrations (registration_id, user_id, source, "
+                    "marketing_opt_in, created_at, user_agent) VALUES (?, ?, ?, ?, ?, ?)",
+                    ("reg_" + secrets.token_urlsafe(10), user_id, source,
+                     int(payload.marketing_opt_in), _now_iso(), ua),
+                )
+        except sqlite3.IntegrityError as exc:
+            if "users.email" in str(exc).lower() or "unique" in str(exc).lower():
+                raise HTTPException(status_code=409, detail="email already registered") from exc
+            raise
+        _, signed, expires = _mint_session(user_id, user_agent=ua)
+        _set_session_cookie(response, signed, expires)
+        logger.info("user registered: %s (source=%s, marketing=%s)",
+                    email, source, payload.marketing_opt_in)
+        return {
+            "user_id": user_id,
+            "email":   email,
+            "name":    payload.name.strip(),
+            "marketing_opt_in": payload.marketing_opt_in,
+        }
+
+    @app.post("/api/auth/login")
+    async def login(
+        payload: LoginPayload,
+        request: Request,
+        response: Response,
+    ) -> dict[str, Any]:
+        email = _normalise_email(payload.email)
+        with _open_db() as conn:
+            row = conn.execute(
+                "SELECT user_id, name, password_hash, marketing_opt_in "
+                "FROM users WHERE email = ?",
+                (email,),
+            ).fetchone()
+        # Constant-ish-time response: always run verify even on
+        # missing user (with a known-bad hash) to avoid leaking
+        # account existence via timing. bcrypt is slow enough that
+        # the side channel is real.
+        good_hash = row["password_hash"] if row else \
+            "$2b$12$0000000000000000000000.0000000000000000000000000000000"
+        ok = _verify_password(payload.password, good_hash) and row is not None
+        if not ok:
+            raise HTTPException(status_code=401, detail="invalid credentials")
+        ua = request.headers.get("user-agent", "")[:200]
+        _, signed, expires = _mint_session(row["user_id"], user_agent=ua)
+        _set_session_cookie(response, signed, expires)
+        return {
+            "user_id": row["user_id"],
+            "email":   email,
+            "name":    row["name"],
+            "marketing_opt_in": bool(row["marketing_opt_in"]),
+        }
+
+    @app.post("/api/auth/logout")
+    async def logout(
+        response: Response,
+        odin_session: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
+    ) -> dict[str, bool]:
+        _delete_session(odin_session)
+        _clear_session_cookie(response)
+        return {"ok": True}
+
+    @app.get("/api/auth/me")
+    async def me(user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
+        return user
+
+    @app.get("/api/users/me/boards")
+    async def my_boards(user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
+        with _open_db() as conn:
+            rows = conn.execute(
+                "SELECT board_id, created_at, last_seen, note FROM boards "
+                "WHERE owner_user_id = ? ORDER BY created_at DESC",
+                (user["user_id"],),
+            ).fetchall()
+        return {
+            "items": [
+                {
+                    "board_id":   r["board_id"],
+                    "created_at": r["created_at"],
+                    "last_seen":  r["last_seen"],
+                    "note":       r["note"],
+                    "url":        f"/b/{r['board_id']}",
+                }
+                for r in rows
+            ],
         }
 
     @app.post("/api/manifests")
@@ -397,7 +801,14 @@ def _build_app() -> FastAPI:
         async def odin() -> Response:
             return FileResponse(STATIC_DIR / "odin.png")
 
+        # SPA catch-all — every non-API path lands on index.html so the
+        # client-side router can decide what to render. Anything under
+        # /api/, /assets/, or /odin.png is handled by the explicit
+        # routes above and never reaches this fallback.
         @app.get("/")
+        @app.get("/login")
+        @app.get("/register")
+        @app.get("/me")
         @app.get("/b/{board_id}")
         async def spa(board_id: str = "") -> Response:
             return FileResponse(STATIC_DIR / "index.html")
