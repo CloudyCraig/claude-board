@@ -77,6 +77,19 @@ export async function listManifests(token: string): Promise<{ items: Manifest[];
   return r.json();
 }
 
+/** Read a board you own without needing a bearer token — cookie auth
+ *  via the /api/boards/{board_id}/manifests route. Used by the web
+ *  UI when the user is signed in; the CLI still uses bearer tokens. */
+export async function listOwnedManifests(boardId: string): Promise<{ items: Manifest[]; board_id: string }> {
+  const r = await fetch(`/api/boards/${encodeURIComponent(boardId)}/manifests`, {
+    credentials: "include",
+  });
+  if (r.status === 401) throw new Error("unauthorized");
+  if (r.status === 404) throw new Error("not-owned");
+  if (!r.ok) throw new Error(`list manifests: ${r.status}`);
+  return r.json();
+}
+
 /**
  * Subscribe to the SSE wake-up stream. Each event from the server is
  * a hint to refetch — we don't trust the event payload itself. The

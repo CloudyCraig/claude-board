@@ -756,6 +756,75 @@ def _build_app() -> FastAPI:
         PUBSUB.publish(board["board_id"], "delete")
         return {"ok": True}
 
+    # ----------------- cookie-auth board access -----------------
+    #
+    # When a user is signed in AND owns the board, they can read it
+    # without a bearer token — the session cookie is enough. This
+    # exists alongside the bearer-token /api/manifests routes (which
+    # the CLI uses) so a logged-in human never has to paste a token
+    # to view their own boards. Tokens are still required for *push*
+    # because the CLI uses them programmatically.
+
+    def _require_owned_board(board_id: str, user: dict[str, Any]) -> dict[str, Any]:
+        with _open_db() as conn:
+            row = conn.execute(
+                "SELECT board_id, created_at, note, owner_user_id "
+                "FROM boards WHERE board_id = ?",
+                (board_id,),
+            ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="board not found")
+        if row["owner_user_id"] != user["user_id"]:
+            # We deliberately return 404 (not 403) so a brute-force
+            # board_id scan can't tell "this board exists but you
+            # don't own it" from "this board doesn't exist".
+            raise HTTPException(status_code=404, detail="board not found")
+        return dict(row)
+
+    @app.get("/api/boards/{board_id}/manifests")
+    async def list_manifests_for_owned(
+        board_id: str,
+        user: dict[str, Any] = Depends(require_user),
+    ) -> dict[str, Any]:
+        _require_owned_board(board_id, user)
+        with _open_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT payload, received_at FROM manifests
+                WHERE board_id = ?
+                ORDER BY updated_at DESC
+                LIMIT 500
+                """,
+                (board_id,),
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for r in rows:
+            try:
+                obj = json.loads(r["payload"])
+            except json.JSONDecodeError:
+                continue
+            obj["received_at"] = r["received_at"]
+            obj["board_id"]    = board_id
+            items.append(obj)
+        return {"items": items, "board_id": board_id}
+
+    @app.delete("/api/boards/{board_id}/manifests/{session_id}")
+    async def delete_manifest_for_owned(
+        board_id: str,
+        session_id: str,
+        user: dict[str, Any] = Depends(require_user),
+    ) -> dict[str, Any]:
+        _require_owned_board(board_id, user)
+        with _open_db() as conn:
+            cur = conn.execute(
+                "DELETE FROM manifests WHERE board_id = ? AND session_id = ?",
+                (board_id, session_id),
+            )
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail="not found")
+        PUBSUB.publish(board_id, "delete")
+        return {"ok": True}
+
     @app.get("/api/manifests/stream")
     async def stream_manifests(
         request: Request,

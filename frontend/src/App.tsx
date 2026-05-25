@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { LoginPage, MyAccountPage, RegisterPage } from "./Auth";
-import { createBoard, fetchMe, listManifests, logoutUser, subscribePolling } from "./api";
+import {
+  createBoard, fetchMe, fetchMyBoards, listManifests, listOwnedManifests,
+  logoutUser, subscribePolling,
+} from "./api";
 import { layout, ringFor, type LaidOutCard } from "./Layout";
 import {
   boardIdFromPath, clearLayout, forgetToken, loadLayout, loadToken,
   saveLayout, saveToken, type LayoutOverrides,
 } from "./storage";
-import type { Manifest, StoredBoard, User } from "./types";
+import type { Manifest, StoredBoard, User, UserBoard } from "./types";
 
 /**
  * Top-level shell. URL drives mode:
@@ -60,14 +63,26 @@ function RouteBody({ route }: { route: Route }): JSX.Element {
 }
 
 function Banner(): JSX.Element {
-  // The banner runs a one-shot fetchMe so it can show the "Signed
-  // in as …" affordance without forcing every page to re-implement
-  // it. We treat 'undefined' as 'still loading' and don't render
-  // either affordance to avoid flicker.
+  // Run a one-shot fetchMe + fetchMyBoards so the banner can offer
+  // a board picker without forcing every page to re-implement it.
+  // 'undefined' means 'still loading' — we render nothing rather
+  // than flicker login/logout affordances.
   const [me, setMe] = useState<User | null | undefined>(undefined);
+  const [boards, setBoards] = useState<UserBoard[]>([]);
+
   useEffect(() => {
     let stopped = false;
-    fetchMe().then((u) => { if (!stopped) setMe(u); }).catch(() => { /* ignore */ });
+    (async (): Promise<void> => {
+      try {
+        const u = await fetchMe();
+        if (stopped) return;
+        setMe(u);
+        if (u) {
+          const bs = await fetchMyBoards();
+          if (!stopped) setBoards(bs);
+        }
+      } catch { /* ignore — banner is optional chrome */ }
+    })();
     return () => { stopped = true; };
   }, []);
 
@@ -83,6 +98,7 @@ function Banner(): JSX.Element {
         <span>Odin</span>
         <span className="tagline">· Claude Board</span>
       </a>
+      {me && boards.length > 0 ? <BoardPicker boards={boards} /> : null}
       <div className="grow" />
       {me === undefined ? null : me ? (
         <>
@@ -100,6 +116,33 @@ function Banner(): JSX.Element {
         self-host on GitHub
       </a>
     </header>
+  );
+}
+
+/** Native <select> board picker. Keeps it accessible and zero-dep —
+ *  no custom dropdown widget. Defaults to "(switch board)" so an
+ *  accidental click doesn't navigate. */
+function BoardPicker({ boards }: { boards: UserBoard[] }): JSX.Element {
+  const currentBoardId = boardIdFromPath();
+  return (
+    <select
+      className="board-picker"
+      value={currentBoardId ?? ""}
+      onChange={(e) => {
+        const id = e.target.value;
+        if (id) window.location.assign(`/b/${id}`);
+      }}
+      title="Switch to one of your boards"
+    >
+      {!currentBoardId
+        ? <option value="">(switch board…)</option>
+        : null}
+      {boards.map((b) => (
+        <option key={b.board_id} value={b.board_id}>
+          {b.note || b.board_id}
+        </option>
+      ))}
+    </select>
   );
 }
 
@@ -232,21 +275,73 @@ The push is idempotent. If the CLI isn't installed, install with:
 // ----------------- board view -----------------
 
 function BoardView({ boardId }: { boardId: string }): JSX.Element {
+  // Three possible auth modes for this view, decided once at mount:
+  //   1. cookie — logged-in user owns this board (preferred — no
+  //      token prompt, ever)
+  //   2. token  — anonymous OR not-owner; use the bearer token from
+  //      localStorage; prompt if missing
+  //   3. probing — still figuring it out; render nothing to avoid
+  //      flicker
+  type Mode = "cookie" | "token" | "probing";
+  const [mode, setMode] = useState<Mode>("probing");
   const [board, setBoard] = useState<StoredBoard | null>(() => loadToken(boardId));
   const [manifests, setManifests] = useState<Manifest[]>([]);
   const [err, setErr] = useState<string>("");
   const [lastRefreshed, setLastRefreshed] = useState<number>(0);
   const [refreshing, setRefreshing] = useState<boolean>(false);
-  // We hold the refresh fn in a ref so the user-triggered button
-  // and the polling timer call the same code path. The polling
-  // setter (subscribePolling) handles its own loop; the ref is for
-  // the manual button.
   const refreshRef = useRef<() => Promise<void>>(async () => {});
 
+  // Probe: try cookie auth first. If 401/404 we fall back to token.
   useEffect(() => {
-    if (!board) return;
     let stopped = false;
+    (async (): Promise<void> => {
+      try {
+        const data = await listOwnedManifests(boardId);
+        if (stopped) return;
+        setManifests(data.items);
+        setLastRefreshed(Date.now());
+        setErr("");
+        setMode("cookie");
+      } catch (e) {
+        if (stopped) return;
+        // Either not signed in, or signed in but not the owner.
+        // Fall back to the token flow.
+        setMode("token");
+      }
+    })();
+    return () => { stopped = true; };
+  }, [boardId]);
 
+  // Cookie-auth refresh loop.
+  useEffect(() => {
+    if (mode !== "cookie") return;
+    let stopped = false;
+    const refresh = async (): Promise<void> => {
+      try {
+        setRefreshing(true);
+        const data = await listOwnedManifests(boardId);
+        if (!stopped) {
+          setManifests(data.items);
+          setLastRefreshed(Date.now());
+          setErr("");
+        }
+      } catch (e) {
+        if (!stopped) setErr((e as Error).message);
+      } finally {
+        if (!stopped) setRefreshing(false);
+      }
+    };
+    refreshRef.current = refresh;
+    // We pass an empty string for the token since subscribePolling
+    // doesn't actually use it (only the callback matters).
+    const unsub = subscribePolling("", refresh, 5000);
+    return () => { stopped = true; unsub(); };
+  }, [mode, boardId]);
+
+  // Token-auth refresh loop.
+  useEffect(() => {
+    if (mode !== "token" || !board) return;
+    let stopped = false;
     const refresh = async (): Promise<void> => {
       try {
         setRefreshing(true);
@@ -263,13 +358,16 @@ function BoardView({ boardId }: { boardId: string }): JSX.Element {
       }
     };
     refreshRef.current = refresh;
-
     const unsub = subscribePolling(board.token, refresh, 5000);
     return () => { stopped = true; unsub(); };
-  }, [board]);
+  }, [mode, board]);
 
-  if (!board) {
-    return <TokenPrompt boardId={boardId} onSaved={setBoard} />;
+  if (mode === "probing") {
+    return <main className="board"><div className="stage" /></main>;
+  }
+
+  if (mode === "token" && !board) {
+    return <TokenPrompt boardId={boardId} onSaved={(b) => { setBoard(b); }} />;
   }
 
   if (err === "unauthorized") {
@@ -294,6 +392,7 @@ function BoardView({ boardId }: { boardId: string }): JSX.Element {
       onRefresh={() => refreshRef.current()}
       refreshing={refreshing}
       lastRefreshed={lastRefreshed}
+      authMode={mode}
     />
   );
 }
@@ -341,13 +440,14 @@ function TokenPrompt({
 // ----------------- the stage -----------------
 
 function Board({
-  boardId, manifests, onRefresh, refreshing, lastRefreshed,
+  boardId, manifests, onRefresh, refreshing, lastRefreshed, authMode,
 }: {
   boardId: string;
   manifests: Manifest[];
   onRefresh: () => void;
   refreshing: boolean;
   lastRefreshed: number;
+  authMode: "cookie" | "token";
 }): JSX.Element {
   const stageRef = useRef<HTMLDivElement>(null);
   const [dims, setDims] = useState<{ w: number; h: number }>({ w: 1200, h: 700 });
@@ -416,6 +516,7 @@ function Board({
           <StageToolbar
             onRefresh={onRefresh} refreshing={refreshing} lastRefreshed={lastRefreshed}
             onResetLayout={resetLayout} hasOverrides={hasOverrides}
+            authMode={authMode}
           />
           <div className="odin-centre">
             <img src="/odin.png" alt="Odin" />
@@ -432,6 +533,7 @@ function Board({
         <StageToolbar
           onRefresh={onRefresh} refreshing={refreshing} lastRefreshed={lastRefreshed}
           onResetLayout={resetLayout} hasOverrides={hasOverrides}
+          authMode={authMode}
         />
         <div className="odin-centre">
           <img src="/odin.png" alt="Odin" />
@@ -474,19 +576,21 @@ function Board({
 // ----------------- toolbar (refresh + reset layout) -----------------
 
 function StageToolbar({
-  onRefresh, refreshing, lastRefreshed, onResetLayout, hasOverrides,
+  onRefresh, refreshing, lastRefreshed, onResetLayout, hasOverrides, authMode,
 }: {
   onRefresh: () => void;
   refreshing: boolean;
   lastRefreshed: number;
   onResetLayout: () => void;
   hasOverrides: boolean;
+  authMode: "cookie" | "token";
 }): JSX.Element {
-  // Force a re-render once a minute so the "Xs ago" stamp stays fresh
-  // even when nothing else changes.
+  // Force a re-render every 5 seconds so the "Xs ago" stamp stays
+  // honest. (Anything coarser and the user can't tell whether the
+  // polling is actually live.)
   const [, force] = useState(0);
   useEffect(() => {
-    const id = window.setInterval(() => force((n) => n + 1), 30_000);
+    const id = window.setInterval(() => force((n) => n + 1), 5_000);
     return () => window.clearInterval(id);
   }, []);
 
@@ -496,14 +600,25 @@ function StageToolbar({
 
   return (
     <div className="stage-toolbar">
-      <span className="meta">{ago}</span>
+      <span
+        className={"auto-indicator " + (refreshing ? "pulse" : "")}
+        title="The board polls the server every 5 seconds. The dot pulses on each fetch."
+      >
+        <span className="dot" />
+        <span>auto · 5s</span>
+      </span>
+      <span className="meta" title={authMode === "cookie"
+        ? "Signed in — no token needed for this board"
+        : "Anonymous — using a bearer token from this browser"}>
+        {ago}
+      </span>
       <button
         className="ghost"
         onClick={onRefresh}
         disabled={refreshing}
-        title="Refresh manifests (also polls automatically every 5 s)"
+        title="Refresh now (the 5-second poll is still running in the background)"
       >
-        {refreshing ? "refreshing…" : "↻ refresh"}
+        {refreshing ? "refreshing…" : "↻ refresh now"}
       </button>
       {hasOverrides ? (
         <button
