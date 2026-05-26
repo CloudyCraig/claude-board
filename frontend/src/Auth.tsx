@@ -16,9 +16,10 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
+import { AttachCommand } from "./App";
 import {
   archiveBoard, deleteBoard, fetchMe, fetchMyBoards, loginUser,
-  logoutUser, registerUser, unarchiveBoard,
+  logoutUser, regenerateBoardToken, registerUser, unarchiveBoard,
 } from "./api";
 import type { User, UserBoard } from "./types";
 
@@ -187,7 +188,11 @@ export function MyAccountPage(): JSX.Element {
   // slow delete doesn't block other rows from being acted on. We
   // intentionally don't reuse a single global flag — boards are
   // independent and the user might want to fire off multiple actions.
-  const [pending, setPending] = useState<Record<string, "archiving" | "unarchiving" | "deleting" | undefined>>({});
+  const [pending, setPending] = useState<Record<string, "archiving" | "unarchiving" | "deleting" | "regenerating" | undefined>>({});
+  // Regenerated-token reveal. We render the new token (one-time) in a
+  // modal-style block so the user sees the same UX as on initial mint
+  // — bearer reveal + copy attach command + "save it now" warning.
+  const [newToken, setNewToken] = useState<{ board_id: string; token: string } | null>(null);
 
   const refresh = useCallback(async (includeArchived: boolean) => {
     try {
@@ -241,7 +246,7 @@ export function MyAccountPage(): JSX.Element {
     await refresh(next);
   };
 
-  const setBusy = (id: string, kind: "archiving" | "unarchiving" | "deleting" | undefined) =>
+  const setBusy = (id: string, kind: "archiving" | "unarchiving" | "deleting" | "regenerating" | undefined) =>
     setPending((p) => ({ ...p, [id]: kind }));
 
   const onArchive = async (b: UserBoard): Promise<void> => {
@@ -263,6 +268,22 @@ export function MyAccountPage(): JSX.Element {
       await refresh(showArchived);
     } catch (ex) {
       window.alert(`Couldn't unarchive: ${(ex as Error).message}`);
+    } finally {
+      setBusy(b.board_id, undefined);
+    }
+  };
+
+  const onRegenerate = async (b: UserBoard): Promise<void> => {
+    const label = b.note || b.board_id;
+    if (!window.confirm(`Regenerate the bearer token for "${label}"?\n\nThe old token stops working immediately. Any machine still using it will get 401s on push until you run \`claude-board attach\` with the new token.`)) {
+      return;
+    }
+    setBusy(b.board_id, "regenerating");
+    try {
+      const r = await regenerateBoardToken(b.board_id);
+      setNewToken({ board_id: r.board_id, token: r.token });
+    } catch (ex) {
+      window.alert(`Couldn't regenerate: ${(ex as Error).message}`);
     } finally {
       setBusy(b.board_id, undefined);
     }
@@ -352,6 +373,14 @@ export function MyAccountPage(): JSX.Element {
                     <td className="meta">{b.last_activity ? b.last_activity.slice(0, 16).replace("T", " ") : "—"}</td>
                     <td className="meta">{b.created_at.slice(0, 10)}</td>
                     <td className="actions">
+                      <button
+                        className="ghost"
+                        disabled={!!busy}
+                        onClick={() => onRegenerate(b)}
+                        title="Mint a new bearer token for this board (old token stops working immediately)"
+                      >
+                        {busy === "regenerating" ? "…" : "🔁 regen token"}
+                      </button>
                       {b.archived ? (
                         <button
                           className="ghost"
@@ -390,6 +419,31 @@ export function MyAccountPage(): JSX.Element {
           <a href="/"><button>create another board</button></a>
           <button onClick={onLogout}>sign out</button>
         </div>
+
+        {/* Regenerated-token reveal. Same UX language as the initial
+            mint dialog — bearer-once + copy attach command + save-now
+            warning — so users hit familiar territory whether they're
+            here for first-time onboarding or recovering a lost token. */}
+        {newToken ? (
+          <div className="new-token-overlay" onClick={(e) => { if (e.target === e.currentTarget) setNewToken(null); }}>
+            <div className="new-token-card">
+              <h3 style={{ marginTop: 0 }}>New token for {newToken.board_id}</h3>
+              <div className="token-reveal">
+                <div className="label">Bearer token (shown once)</div>
+                <div>{newToken.token}</div>
+                <div className="warn">⚠ Save this now — the previous token is already invalid.</div>
+              </div>
+              <AttachCommand
+                boardId={newToken.board_id}
+                token={newToken.token}
+                label="Update your laptop's board.config"
+              />
+              <div style={{ marginTop: 16, textAlign: "right" }}>
+                <button onClick={() => setNewToken(null)}>done</button>
+              </div>
+            </div>
+          </div>
+        ) : null}
       </section>
     </main>
   );

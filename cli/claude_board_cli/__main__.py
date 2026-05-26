@@ -383,6 +383,109 @@ def cmd_watch(args: argparse.Namespace) -> int:
         time.sleep(interval)
 
 
+def cmd_attach(args: argparse.Namespace) -> int:
+    """Point ~/.claude/board.config at a specific board, verifying the
+    token works BEFORE writing so a typo doesn't leave the user stuck.
+
+    This is the UI-driven onboarding endpoint: the web mint dialog
+    shows a one-line `claude-board attach <id> <token>` that the user
+    pastes once. The same command works for swapping to a different
+    board or recovering from a regenerated token (see /me on the
+    server). No hand-editing of dotfiles required.
+
+    Atomic write: tmp file + rename so a half-written config can
+    never replace a working one even if the script is killed mid-call."""
+    server = (args.server or _read_config().get("server")
+              or "https://odin.heimdallsystems.ai").rstrip("/")
+    board_id = args.board_id.strip()
+    token    = args.token.strip()
+    if not board_id or not token:
+        print("usage: claude-board attach <board_id> <token> [--server URL]", file=sys.stderr)
+        return 2
+
+    # Probe: does this token resolve, and to the board the user thinks?
+    # Wrap in try/except because _request only catches HTTPError —
+    # URLError (DNS failure, connection refused, TLS handshake error)
+    # bubbles up and would crash with a stacktrace, which is the wrong
+    # UX for "you typed the server URL wrong".
+    try:
+        status, body = _request("GET", f"{server}/api/manifests", token=token)
+    except urllib.error.URLError as e:
+        print(f"couldn't reach {server} — {e.reason}", file=sys.stderr)
+        return 1
+    if status == 401:
+        print(f"server rejected the token at {server}.", file=sys.stderr)
+        print("check that you pasted it without truncation or extra whitespace.",
+              file=sys.stderr)
+        return 1
+    if status >= 300:
+        print(f"server returned HTTP {status} — {body}", file=sys.stderr)
+        return 1
+    actual = body.get("board_id") if isinstance(body, dict) else None
+    if actual and actual != board_id:
+        print(f"token belongs to {actual}, not {board_id} — refusing to write.",
+              file=sys.stderr)
+        return 1
+
+    cfg_path = Path.home() / ".claude" / "board.config"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    content = (
+        f"server   = {server}\n"
+        f"token    = {token}\n"
+        f"board_id = {board_id}\n"
+    )
+    tmp = cfg_path.with_suffix(".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass     # Windows / non-POSIX; the rename below still works
+    os.replace(tmp, cfg_path)
+
+    print(f"attached to {board_id} on {server}")
+    print(f"  wrote {cfg_path}  (mode 0600)")
+    print(f"  next claude-board push from this machine goes here.")
+    return 0
+
+
+def cmd_set_claude_url(args: argparse.Namespace) -> int:
+    """Attach (or clear) the claude_url field on a session's manifest.
+
+    When the user runs /rc inside their Claude Code session, the CLI
+    prints a line like
+
+        /remote-control is active · Continue here, on your phone,
+        or at https://claude.ai/code/session_<id>
+
+    Pasting that URL into the manifest's `claude_url` field gives the
+    board card a working "open in claude" badge — claude.ai's AASA
+    file routes /code/* to Claude.app via Apple Universal Links on
+    macOS / iPad, so clicks in Safari land in the desktop app rather
+    than the browser.
+
+    Pass an empty string as the URL to clear the field. The next
+    push (or the Stop-hook push at end of turn) propagates the
+    change to the board within seconds; no extra step needed."""
+    p = _resolve_session_id(args.session_id)
+    if p is None:
+        print("no manifest to update — pass --session-id or run from inside an active session",
+              file=sys.stderr)
+        return 1
+    url = (args.url or "").strip()
+    obj = json.loads(p.read_text(encoding="utf-8"))
+    if url:
+        obj["claude_url"] = url
+    else:
+        obj.pop("claude_url", None)
+    obj["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    p.write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8")
+    if url:
+        print(f"set claude_url on {p.stem}  →  {url}")
+    else:
+        print(f"cleared claude_url on {p.stem}")
+    return 0
+
+
 def cmd_bootstrap(args: argparse.Namespace) -> int:
     """Called from the SessionStart hook. Reads the hook JSON on stdin
     (per https://code.claude.com/docs/en/hooks the payload includes
@@ -583,6 +686,23 @@ def main(argv: list[str] | None = None) -> int:
     p_del = sub.add_parser("delete", help="Delete a session's manifest (local + server).")
     p_del.add_argument("session_id")
     p_del.set_defaults(func=cmd_delete)
+
+    p_url = sub.add_parser("set-claude-url",
+                           help="Set or clear the claude.ai 'open in claude' URL on a session's manifest.")
+    p_url.add_argument("url",
+                       help="The claude.ai URL — paste the one /rc prints. "
+                            "Use \"\" to clear and revert to the default fallback.")
+    p_url.add_argument("--session-id", default=None,
+                       help="Session to update (default: most recently modified manifest)")
+    p_url.set_defaults(func=cmd_set_claude_url)
+
+    p_attach = sub.add_parser("attach",
+                              help="Point ~/.claude/board.config at a board (verifies token first).")
+    p_attach.add_argument("board_id", help="The brd_… id")
+    p_attach.add_argument("token", help="The bearer token (shown once when minted)")
+    p_attach.add_argument("--server", default=None,
+                          help="Server URL (defaults to existing config or https://odin.heimdallsystems.ai)")
+    p_attach.set_defaults(func=cmd_attach)
 
     p_boot = sub.add_parser("bootstrap",
                             help="Create a manifest from SessionStart hook stdin (idempotent; source=startup only).")

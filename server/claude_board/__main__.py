@@ -1067,6 +1067,38 @@ def _build_app() -> FastAPI:
             )
         return {"ok": True}
 
+    @app.post("/api/boards/{board_id}/regenerate-token")
+    async def regenerate_board_token(
+        board_id: str,
+        user: dict[str, Any] = Depends(require_user),
+    ) -> dict[str, Any]:
+        """Owner-only. Mint a fresh bearer token for an existing board.
+        Old token is invalidated immediately (only token_hash is stored,
+        so the previous plaintext is unrecoverable anyway — but we
+        overwrite the hash with the new one's so any pasted-elsewhere
+        copies of the old token instantly stop working).
+
+        Returns the new token plaintext exactly once, same one-time
+        reveal pattern as initial mint. The caller is responsible for
+        showing it to the user with the standard "save this now" copy.
+        Boards keep their board_id, owner, and all sessions/history."""
+        _require_owned_board(board_id, user)
+        new_token = secrets.token_urlsafe(32)
+        with _open_db() as conn:
+            cur = conn.execute(
+                "UPDATE boards SET token_hash = ?, last_seen = ? WHERE board_id = ?",
+                (_hash_token(new_token), _now_iso(), board_id),
+            )
+            if cur.rowcount == 0:
+                # Lost a race with delete? Treat as 404 — the board is
+                # gone, regenerate makes no sense.
+                raise HTTPException(status_code=404, detail="board not found")
+        return {
+            "ok":       True,
+            "board_id": board_id,
+            "token":    new_token,
+        }
+
     @app.delete("/api/boards/{board_id}")
     async def delete_board(
         board_id: str,

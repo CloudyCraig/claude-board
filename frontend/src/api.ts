@@ -95,6 +95,16 @@ export async function deleteBoard(boardId: string): Promise<void> {
   if (!r.ok) throw new Error(`delete board: ${r.status}`);
 }
 
+/** Mint a fresh bearer token for an owned board. Returns the plaintext
+ *  once — the caller is responsible for the one-time reveal. The old
+ *  token stops resolving the instant this returns. */
+export async function regenerateBoardToken(boardId: string): Promise<{ token: string; board_id: string }> {
+  const r = await fetch(`/api/boards/${encodeURIComponent(boardId)}/regenerate-token`, {
+    method: "POST", credentials: "include",
+  });
+  return jsonOrThrow<{ token: string; board_id: string }>(r, "regenerate token");
+}
+
 export async function listManifests(token: string): Promise<{ items: Manifest[]; board_id: string }> {
   const r = await fetch("/api/manifests", {
     headers: { Authorization: `Bearer ${token}` },

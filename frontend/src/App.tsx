@@ -222,23 +222,91 @@ function Landing(): JSX.Element {
             <div className="token-reveal">
               <div className="label">Bearer token (shown once)</div>
               <div>{result.token}</div>
-              <div className="warn">⚠ copy this now — there is no recovery.</div>
+              <div className="warn">⚠ Save this now — if lost, regenerate from your account page.</div>
             </div>
+
+            {/* The primary onboarding action: one command, one paste.
+                We deliberately put this ABOVE the board URL and the
+                CLAUDE.md snippet — connecting a laptop is what 95% of
+                users came here for, and they shouldn't have to read
+                past anything to find it. */}
+            <AttachCommand boardId={result.board_id} token={result.token} />
+
             <label>Your board URL</label>
             <div className="copy-row">
               <input type="text" readOnly value={boardUrl} style={{ flex: 1 }} onFocus={(e) => e.currentTarget.select()} />
               <button onClick={() => navigator.clipboard?.writeText(boardUrl)}>copy</button>
               <a href={boardUrl}><button className="primary">open →</button></a>
             </div>
-            <label>Paste into your <code>~/.claude/CLAUDE.md</code></label>
-            <pre className="snippet">{snippet}</pre>
-            <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
-              <button onClick={() => navigator.clipboard?.writeText(snippet)}>copy snippet</button>
-            </div>
+
+            {/* The CLAUDE.md snippet is still useful for users who want
+                future Claude sessions to know about the board, but it's
+                no longer the main onboarding artefact — it's reference
+                material. Collapsed by default to keep the dialog calm. */}
+            <details style={{ marginTop: 18 }}>
+              <summary style={{ cursor: "pointer", color: "var(--text-mute)" }}>
+                Optional: snippet for <code>~/.claude/CLAUDE.md</code>
+              </summary>
+              <pre className="snippet">{snippet}</pre>
+              <div style={{ marginTop: 8 }}>
+                <button onClick={() => navigator.clipboard?.writeText(snippet)}>copy snippet</button>
+              </div>
+            </details>
           </>
         )}
       </section>
     </main>
+  );
+}
+
+/**
+ * The "connect this board to a laptop" affordance. One line of shell
+ * with a copy button and a 2-second "copied" confirmation. Used in
+ * both the mint dialog (new board) and the regenerate-token flow on
+ * My Account (existing board, new token). Kept as a shared component
+ * so the experience is identical in both places.
+ */
+export function AttachCommand({
+  boardId, token, server, label,
+}: {
+  boardId: string;
+  token: string;
+  /** Defaults to the current page origin — only override for tests. */
+  server?: string;
+  /** Defaults to "Run this on your laptop"; some contexts want
+   *  "Update your laptop with the new token" etc. */
+  label?: string;
+}): JSX.Element {
+  const origin = server ?? (typeof window !== "undefined" ? window.location.origin : "");
+  const cmd = origin && origin !== "https://odin.heimdallsystems.ai"
+    ? `claude-board attach ${boardId} ${token} --server ${origin}`
+    : `claude-board attach ${boardId} ${token}`;
+  const [copied, setCopied] = useState(false);
+
+  const onCopy = async (): Promise<void> => {
+    try {
+      await navigator.clipboard?.writeText(cmd);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+    } catch {
+      /* clipboard blocked — the user can still triple-click + copy */
+    }
+  };
+
+  return (
+    <div className="attach-block">
+      <div className="attach-label">{label ?? "Run this on your laptop"}</div>
+      <div className="attach-row">
+        <code className="attach-cmd">{cmd}</code>
+        <button onClick={onCopy} className="primary attach-copy">
+          {copied ? "✓ copied" : "📋 copy"}
+        </button>
+      </div>
+      <div className="attach-hint">
+        Verifies the token, then writes <code>~/.claude/board.config</code> atomically.
+        Safe to re-run — that's also how you switch existing machines to a new board.
+      </div>
+    </div>
   );
 }
 

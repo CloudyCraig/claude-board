@@ -784,6 +784,74 @@ input[type="text"]:focus, input[type="url"]:focus { border-color: var(--odin); }
   color: var(--odin-soft);
 }
 
+/* ---- Attach command (mint dialog + regen-token modal) ---- */
+.attach-block {
+  margin: 20px 0 8px;
+  padding: 16px;
+  border: 1px solid var(--odin, #6e7bf2);
+  border-radius: 10px;
+  background: linear-gradient(180deg, #1c2766aa, #0a0f2cea);
+}
+.attach-label {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--odin-soft, #aab4ff);
+  margin-bottom: 10px;
+}
+.attach-row {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+}
+.attach-cmd {
+  flex: 1;
+  display: block;
+  padding: 12px 14px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 13px;
+  background: #02030a;
+  border: 1px solid var(--border, #1c2147);
+  border-radius: 6px;
+  color: var(--text, #e6e9ff);
+  overflow-x: auto;
+  white-space: nowrap;
+  user-select: all;
+}
+.attach-copy {
+  white-space: nowrap;
+  min-width: 96px;
+}
+.attach-hint {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--text-mute, #8b91b8);
+  line-height: 1.5;
+}
+
+/* ---- New-token reveal modal (on /me regenerate) ---- */
+.new-token-overlay {
+  position: fixed;
+  inset: 0;
+  background: #02030acc;
+  backdrop-filter: blur(4px);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+}
+.new-token-card {
+  background: linear-gradient(180deg, #0d1230, #070a1f);
+  border: 1px solid var(--border, #1c2147);
+  border-radius: 14px;
+  padding: 24px 26px;
+  max-width: 720px;
+  width: 100%;
+  box-shadow: 0 20px 80px #0008;
+}
+
 /* ---- My Account: boards management ---- */
 .boards-manage { max-width: 900px; }
 .boards-manage-head {
