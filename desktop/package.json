@@ -18,6 +18,12 @@
     "appId": "ai.heimdallsystems.claude-control",
     "productName": "Heimdall Claude Control",
     "copyright": "© 2026 Heimdall Systems",
+    "protocols": [
+      {
+        "name": "Claude Board attach",
+        "schemes": ["claude-board"]
+      }
+    ],
     "directories": {
       "output": "dist-app",
       "buildResources": "build"

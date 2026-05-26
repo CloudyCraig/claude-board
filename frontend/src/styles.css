@@ -823,6 +823,16 @@ input[type="text"]:focus, input[type="url"]:focus { border-color: var(--odin); }
   white-space: nowrap;
   min-width: 96px;
 }
+.attach-install {
+  white-space: nowrap;
+  min-width: 96px;
+  background: transparent;
+  border: 1px solid var(--odin, #6e7bf2);
+  color: var(--odin-soft, #aab4ff);
+}
+.attach-install:hover {
+  background: #1c276655;
+}
 .attach-hint {
   margin-top: 10px;
   font-size: 12px;

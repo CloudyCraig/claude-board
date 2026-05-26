@@ -293,6 +293,24 @@ export function AttachCommand({
     }
   };
 
+  // One-click install via the Heimdall Claude Control desktop app's
+  // claude-board:// URL scheme handler. We deliberately fire this
+  // via an anchor element rather than window.location so the
+  // current page doesn't unload if no handler is registered. On
+  // browsers with a registered handler (macOS w/ desktop app), this
+  // hands off to the desktop app and shows a system confirmation.
+  // On browsers without one (mobile, web-only users), the click is
+  // a silent no-op — the copy button remains the working path.
+  const onInstall = (): void => {
+    const url = `claude-board://attach?b=${encodeURIComponent(boardId)}&t=${encodeURIComponent(token)}`;
+    const a = document.createElement("a");
+    a.href = url;
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
+
   return (
     <div className="attach-block">
       <div className="attach-label">{label ?? "Run this on your laptop"}</div>
@@ -300,6 +318,13 @@ export function AttachCommand({
         <code className="attach-cmd">{cmd}</code>
         <button onClick={onCopy} className="primary attach-copy">
           {copied ? "✓ copied" : "📋 copy"}
+        </button>
+        <button
+          onClick={onInstall}
+          className="attach-install"
+          title="One-click attach via the Heimdall Claude Control desktop app (requires the app + the claude-board CLI installed)"
+        >
+          🪐 install
         </button>
       </div>
       <div className="attach-hint">
