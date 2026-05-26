@@ -306,6 +306,27 @@ export function AttachCommand({
         Verifies the token, then writes <code>~/.claude/board.config</code> atomically.
         Safe to re-run — that's also how you switch existing machines to a new board.
       </div>
+      <details className="attach-firstrun">
+        <summary>First time on this machine? <code>command not found: claude-board</code>?</summary>
+        <p>
+          The <code>claude-board</code> CLI ships separately. One-time install with{" "}
+          <a href="https://pipx.pypa.io/" target="_blank" rel="noreferrer">pipx</a>:
+        </p>
+        <pre className="snippet">{`# install pipx if you don't have it
+brew install pipx
+pipx ensurepath
+
+# install claude-board
+pipx install git+https://github.com/CloudyCraig/claude-board#subdirectory=cli
+
+# restart your terminal, then re-run the attach command above`}</pre>
+        <p style={{ color: "var(--text-dim)", fontSize: 12 }}>
+          Already installed but still "command not found"? <code>~/.local/bin</code> probably
+          isn't on your PATH — add{" "}
+          <code>export PATH="$HOME/.local/bin:$PATH"</code> to <code>~/.zshrc</code>{" "}
+          (or <code>~/.bashrc</code>) and restart your shell.
+        </p>
+      </details>
     </div>
   );
 }
