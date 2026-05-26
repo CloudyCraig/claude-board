@@ -36,6 +36,25 @@ export interface Manifest {
   received_at?:      string;
 }
 
+/** Archive entry — the final state of a session at the moment it was
+ *  moved out of the live board. The `manifest` it holds is whatever
+ *  Claude last pushed; `push_count` lets the replay UI show "n frames"
+ *  without fetching the full history. */
+export interface Archive extends Manifest {
+  archived_at: string;
+  push_count:  number;
+}
+
+/** One entry in a session's history feed. `push_num` is the 1-based
+ *  sequence within (board_id, session_id); the scrubber maps slider
+ *  position → push_num. `manifest` is the manifest as-of that push. */
+export interface HistoryEntry {
+  push_num:    number;
+  manifest:    Manifest;
+  updated_at:  string;
+  received_at: string;
+}
+
 export interface BoardCreate {
   board_id: string;
   token:    string;

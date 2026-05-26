@@ -113,6 +113,48 @@ CREATE TABLE IF NOT EXISTS manifests (
 CREATE INDEX IF NOT EXISTS idx_manifests_board_updated
     ON manifests(board_id, updated_at DESC);
 
+-- Append-only history of every manifest push. Lets a session be
+-- "replayed" — scrubbed through frame by frame — even after the
+-- live row is gone. `push_num` is a per-session sequence starting
+-- at 1; we compute it transactionally on insert so concurrent pushes
+-- for the same session can't collide.
+--
+-- We intentionally do NOT cascade-delete from this table when the
+-- live `manifests` row is removed: history outlives the card. The
+-- only paths that clear history are (a) an explicit DELETE on the
+-- session by the owner (nuclear option) and (b) — eventually — a
+-- retention policy on the board. For now history is unbounded; rows
+-- are small text and growth is bounded by the human at the keyboard.
+CREATE TABLE IF NOT EXISTS manifest_history (
+    board_id    TEXT NOT NULL,
+    session_id  TEXT NOT NULL,
+    push_num    INTEGER NOT NULL,
+    payload     TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    PRIMARY KEY (board_id, session_id, push_num)
+);
+
+CREATE INDEX IF NOT EXISTS idx_manifest_history_session
+    ON manifest_history(board_id, session_id, push_num);
+
+-- User-archived sessions. Distinct from auto-prune: when a user
+-- clicks "archive" on a card, we move the live row here and keep
+-- it indefinitely, paired with the manifest_history rows for
+-- replay. The auto-prune loop only touches `manifests` (live), not
+-- this table.
+CREATE TABLE IF NOT EXISTS archives (
+    board_id      TEXT NOT NULL,
+    session_id    TEXT NOT NULL,
+    final_payload TEXT NOT NULL,       -- the manifest at archive time
+    archived_at   TEXT NOT NULL,
+    push_count    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (board_id, session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_archives_board_time
+    ON archives(board_id, archived_at DESC);
+
 -- Odin v2: user accounts, sessions, registration audit log.
 CREATE TABLE IF NOT EXISTS users (
     user_id          TEXT PRIMARY KEY,
@@ -694,25 +736,53 @@ def _build_app() -> FastAPI:
         raw = payload.model_dump_json()
         if len(raw) > 64_000:
             raise HTTPException(status_code=413, detail="manifest too large (>64 KB)")
+        received = _now_iso()
+        updated  = payload.updated_at or received
         with _open_db() as conn:
-            conn.execute(
-                """
-                INSERT INTO manifests (board_id, session_id, payload, status,
-                                       blocked_on_user, updated_at, received_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(board_id, session_id) DO UPDATE SET
-                    payload         = excluded.payload,
-                    status          = excluded.status,
-                    blocked_on_user = excluded.blocked_on_user,
-                    updated_at      = excluded.updated_at,
-                    received_at     = excluded.received_at
-                """,
-                (
-                    board["board_id"], payload.session_id, raw,
-                    payload.status, int(payload.blocked_on_user),
-                    payload.updated_at or _now_iso(), _now_iso(),
-                ),
-            )
+            # Wrap the upsert + history append in one transaction so a
+            # concurrent push for the same session can't observe a
+            # half-applied state (and can't race on push_num).
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO manifests (board_id, session_id, payload, status,
+                                           blocked_on_user, updated_at, received_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(board_id, session_id) DO UPDATE SET
+                        payload         = excluded.payload,
+                        status          = excluded.status,
+                        blocked_on_user = excluded.blocked_on_user,
+                        updated_at      = excluded.updated_at,
+                        received_at     = excluded.received_at
+                    """,
+                    (
+                        board["board_id"], payload.session_id, raw,
+                        payload.status, int(payload.blocked_on_user),
+                        updated, received,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO manifest_history
+                        (board_id, session_id, push_num, payload, updated_at, received_at)
+                    VALUES (
+                        ?, ?,
+                        COALESCE((SELECT MAX(push_num) + 1 FROM manifest_history
+                                  WHERE board_id = ? AND session_id = ?), 1),
+                        ?, ?, ?
+                    )
+                    """,
+                    (
+                        board["board_id"], payload.session_id,
+                        board["board_id"], payload.session_id,
+                        raw, updated, received,
+                    ),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
         PUBSUB.publish(board["board_id"], "update")
         return {"ok": True, "board_id": board["board_id"], "session_id": payload.session_id}
 
@@ -741,20 +811,169 @@ def _build_app() -> FastAPI:
             items.append(obj)
         return {"items": items, "board_id": board["board_id"]}
 
+    # ---- archive / history helpers (shared by both auth flavours) ----
+
+    def _archive_session_now(board_id: str, session_id: str) -> bool:
+        """Move the live manifest into the archives table. Returns
+        True on success, False if there was nothing to archive. History
+        rows in manifest_history are left in place — they're keyed by
+        (board_id, session_id) so the archive view can reconstruct the
+        timeline by JOIN.
+
+        Wrapped in BEGIN IMMEDIATE so we can't half-archive."""
+        archived_at = _now_iso()
+        with _open_db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT payload FROM manifests WHERE board_id = ? AND session_id = ?",
+                    (board_id, session_id),
+                ).fetchone()
+                if row is None:
+                    conn.execute("ROLLBACK")
+                    return False
+                count = conn.execute(
+                    "SELECT COUNT(*) AS n FROM manifest_history "
+                    "WHERE board_id = ? AND session_id = ?",
+                    (board_id, session_id),
+                ).fetchone()["n"]
+                conn.execute(
+                    """
+                    INSERT INTO archives (board_id, session_id, final_payload,
+                                          archived_at, push_count)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(board_id, session_id) DO UPDATE SET
+                        final_payload = excluded.final_payload,
+                        archived_at   = excluded.archived_at,
+                        push_count    = excluded.push_count
+                    """,
+                    (board_id, session_id, row["payload"], archived_at, count),
+                )
+                conn.execute(
+                    "DELETE FROM manifests WHERE board_id = ? AND session_id = ?",
+                    (board_id, session_id),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return True
+
+    def _nuke_session(board_id: str, session_id: str) -> bool:
+        """The destructive option: delete the live row, all history,
+        and any archive entry for this session. Used by DELETE."""
+        with _open_db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    "DELETE FROM manifests WHERE board_id = ? AND session_id = ?",
+                    (board_id, session_id),
+                )
+                manifests_removed = cur.rowcount
+                arch = conn.execute(
+                    "DELETE FROM archives WHERE board_id = ? AND session_id = ?",
+                    (board_id, session_id),
+                ).rowcount
+                conn.execute(
+                    "DELETE FROM manifest_history WHERE board_id = ? AND session_id = ?",
+                    (board_id, session_id),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return (manifests_removed + arch) > 0
+
+    def _list_archives_for_board(board_id: str) -> list[dict[str, Any]]:
+        with _open_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT session_id, final_payload, archived_at, push_count
+                FROM archives WHERE board_id = ?
+                ORDER BY archived_at DESC
+                LIMIT 500
+                """,
+                (board_id,),
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for r in rows:
+            try:
+                obj = json.loads(r["final_payload"])
+            except json.JSONDecodeError:
+                continue
+            obj["archived_at"] = r["archived_at"]
+            obj["push_count"]  = r["push_count"]
+            obj["board_id"]    = board_id
+            items.append(obj)
+        return items
+
+    def _fetch_history(board_id: str, session_id: str) -> list[dict[str, Any]]:
+        """All pushes for one session, oldest first. Each entry is the
+        decoded payload at that point in time, plus push_num and
+        timestamps. The frontend uses this to re-render the card frame
+        by frame during replay."""
+        with _open_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT push_num, payload, updated_at, received_at
+                FROM manifest_history
+                WHERE board_id = ? AND session_id = ?
+                ORDER BY push_num ASC
+                LIMIT 5000
+                """,
+                (board_id, session_id),
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            try:
+                obj = json.loads(r["payload"])
+            except json.JSONDecodeError:
+                continue
+            out.append({
+                "push_num":    r["push_num"],
+                "manifest":    obj,
+                "updated_at":  r["updated_at"],
+                "received_at": r["received_at"],
+            })
+        return out
+
     @app.delete("/api/manifests/{session_id}")
     async def delete_manifest(
         session_id: str,
         board: dict[str, Any] = Depends(require_board),
     ) -> dict[str, Any]:
-        with _open_db() as conn:
-            cur = conn.execute(
-                "DELETE FROM manifests WHERE board_id = ? AND session_id = ?",
-                (board["board_id"], session_id),
-            )
-            if cur.rowcount == 0:
-                raise HTTPException(status_code=404, detail="not found")
+        if not _nuke_session(board["board_id"], session_id):
+            raise HTTPException(status_code=404, detail="not found")
         PUBSUB.publish(board["board_id"], "delete")
         return {"ok": True}
+
+    @app.post("/api/manifests/{session_id}/archive")
+    async def archive_manifest(
+        session_id: str,
+        board: dict[str, Any] = Depends(require_board),
+    ) -> dict[str, Any]:
+        if not _archive_session_now(board["board_id"], session_id):
+            raise HTTPException(status_code=404, detail="not found")
+        PUBSUB.publish(board["board_id"], "archive")
+        return {"ok": True}
+
+    @app.get("/api/archives")
+    async def list_archives(
+        board: dict[str, Any] = Depends(require_board),
+    ) -> dict[str, Any]:
+        return {"items": _list_archives_for_board(board["board_id"]),
+                "board_id": board["board_id"]}
+
+    @app.get("/api/manifests/{session_id}/history")
+    async def manifest_history(
+        session_id: str,
+        board: dict[str, Any] = Depends(require_board),
+    ) -> dict[str, Any]:
+        items = _fetch_history(board["board_id"], session_id)
+        if not items:
+            raise HTTPException(status_code=404, detail="no history for this session")
+        return {"items": items, "board_id": board["board_id"],
+                "session_id": session_id}
 
     # ----------------- cookie-auth board access -----------------
     #
@@ -815,15 +1034,42 @@ def _build_app() -> FastAPI:
         user: dict[str, Any] = Depends(require_user),
     ) -> dict[str, Any]:
         _require_owned_board(board_id, user)
-        with _open_db() as conn:
-            cur = conn.execute(
-                "DELETE FROM manifests WHERE board_id = ? AND session_id = ?",
-                (board_id, session_id),
-            )
-            if cur.rowcount == 0:
-                raise HTTPException(status_code=404, detail="not found")
+        if not _nuke_session(board_id, session_id):
+            raise HTTPException(status_code=404, detail="not found")
         PUBSUB.publish(board_id, "delete")
         return {"ok": True}
+
+    @app.post("/api/boards/{board_id}/manifests/{session_id}/archive")
+    async def archive_for_owned(
+        board_id: str,
+        session_id: str,
+        user: dict[str, Any] = Depends(require_user),
+    ) -> dict[str, Any]:
+        _require_owned_board(board_id, user)
+        if not _archive_session_now(board_id, session_id):
+            raise HTTPException(status_code=404, detail="not found")
+        PUBSUB.publish(board_id, "archive")
+        return {"ok": True}
+
+    @app.get("/api/boards/{board_id}/archives")
+    async def list_archives_for_owned(
+        board_id: str,
+        user: dict[str, Any] = Depends(require_user),
+    ) -> dict[str, Any]:
+        _require_owned_board(board_id, user)
+        return {"items": _list_archives_for_board(board_id), "board_id": board_id}
+
+    @app.get("/api/boards/{board_id}/sessions/{session_id}/history")
+    async def history_for_owned(
+        board_id: str,
+        session_id: str,
+        user: dict[str, Any] = Depends(require_user),
+    ) -> dict[str, Any]:
+        _require_owned_board(board_id, user)
+        items = _fetch_history(board_id, session_id)
+        if not items:
+            raise HTTPException(status_code=404, detail="no history for this session")
+        return {"items": items, "board_id": board_id, "session_id": session_id}
 
     @app.get("/api/manifests/stream")
     async def stream_manifests(

@@ -1,4 +1,4 @@
-import { BoardCreate, Manifest, RegisterPayload, User, UserBoard } from "./types";
+import { Archive, BoardCreate, HistoryEntry, Manifest, RegisterPayload, User, UserBoard } from "./types";
 
 // The frontend either runs on the same origin as the API (the
 // production case — FastAPI serves the bundle) OR proxies to it via
@@ -87,6 +87,83 @@ export async function listOwnedManifests(boardId: string): Promise<{ items: Mani
   if (r.status === 401) throw new Error("unauthorized");
   if (r.status === 404) throw new Error("not-owned");
   if (!r.ok) throw new Error(`list manifests: ${r.status}`);
+  return r.json();
+}
+
+/** Delete a session via the bearer-token endpoint (token mode). The
+ *  server returns 204 on success and 404 if the row's already gone —
+ *  we treat 404 as success because the caller's intent was "make
+ *  this not exist", and the postcondition is satisfied either way. */
+export async function deleteManifestByToken(token: string, sessionId: string): Promise<void> {
+  const r = await fetch(`/api/manifests/${encodeURIComponent(sessionId)}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!r.ok && r.status !== 404) throw new Error(`delete manifest: ${r.status}`);
+}
+
+/** Delete via cookie auth — used when the signed-in owner is viewing
+ *  their own board (no token needed). Same 404-is-fine semantics. */
+export async function deleteManifestByCookie(boardId: string, sessionId: string): Promise<void> {
+  const r = await fetch(
+    `/api/boards/${encodeURIComponent(boardId)}/manifests/${encodeURIComponent(sessionId)}`,
+    { method: "DELETE", credentials: "include" },
+  );
+  if (!r.ok && r.status !== 404) throw new Error(`delete manifest: ${r.status}`);
+}
+
+// ----- Archive + replay -----
+
+export async function archiveByToken(token: string, sessionId: string): Promise<void> {
+  const r = await fetch(`/api/manifests/${encodeURIComponent(sessionId)}/archive`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!r.ok && r.status !== 404) throw new Error(`archive: ${r.status}`);
+}
+
+export async function archiveByCookie(boardId: string, sessionId: string): Promise<void> {
+  const r = await fetch(
+    `/api/boards/${encodeURIComponent(boardId)}/manifests/${encodeURIComponent(sessionId)}/archive`,
+    { method: "POST", credentials: "include" },
+  );
+  if (!r.ok && r.status !== 404) throw new Error(`archive: ${r.status}`);
+}
+
+export async function listArchivesByToken(token: string): Promise<{ items: Archive[]; board_id: string }> {
+  const r = await fetch("/api/archives", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!r.ok) throw new Error(`list archives: ${r.status}`);
+  return r.json();
+}
+
+export async function listArchivesByCookie(boardId: string): Promise<{ items: Archive[]; board_id: string }> {
+  const r = await fetch(`/api/boards/${encodeURIComponent(boardId)}/archives`, {
+    credentials: "include",
+  });
+  if (!r.ok) throw new Error(`list archives: ${r.status}`);
+  return r.json();
+}
+
+export async function fetchHistoryByToken(
+  token: string, sessionId: string,
+): Promise<{ items: HistoryEntry[] }> {
+  const r = await fetch(`/api/manifests/${encodeURIComponent(sessionId)}/history`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!r.ok) throw new Error(`history: ${r.status}`);
+  return r.json();
+}
+
+export async function fetchHistoryByCookie(
+  boardId: string, sessionId: string,
+): Promise<{ items: HistoryEntry[] }> {
+  const r = await fetch(
+    `/api/boards/${encodeURIComponent(boardId)}/sessions/${encodeURIComponent(sessionId)}/history`,
+    { credentials: "include" },
+  );
+  if (!r.ok) throw new Error(`history: ${r.status}`);
   return r.json();
 }
 

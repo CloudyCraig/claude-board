@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ArchivesView } from "./Archives";
 import { LoginPage, MyAccountPage, RegisterPage } from "./Auth";
 import {
-  createBoard, fetchMe, fetchMyBoards, listManifests, listOwnedManifests,
+  archiveByCookie, archiveByToken,
+  createBoard, deleteManifestByCookie, deleteManifestByToken,
+  fetchMe, fetchMyBoards, listManifests, listOwnedManifests,
   logoutUser, subscribePolling,
 } from "./api";
 import { layout, ringFor, type LaidOutCard } from "./Layout";
@@ -289,6 +292,13 @@ function BoardView({ boardId }: { boardId: string }): JSX.Element {
   const [err, setErr] = useState<string>("");
   const [lastRefreshed, setLastRefreshed] = useState<number>(0);
   const [refreshing, setRefreshing] = useState<boolean>(false);
+  // View toggle: "live" shows the polar cards (default); "archives"
+  // shows the list of archived sessions with replay affordances.
+  // Declared up here with the other useState calls — Rules of Hooks
+  // forbid putting it after the early-return branches below, since
+  // the first render (mode==="probing") would skip it and the next
+  // render would call it as an "extra" hook.
+  const [view, setView] = useState<"live" | "archives">("live");
   const refreshRef = useRef<() => Promise<void>>(async () => {});
 
   // Probe: try cookie auth first. If 401/404 we fall back to token.
@@ -385,6 +395,46 @@ function BoardView({ boardId }: { boardId: string }): JSX.Element {
     );
   }
 
+  // Delete handler. Picks the right auth flavour for the current
+  // mode, then optimistically prunes from local state so the card
+  // vanishes immediately (the next 5s poll would have done it
+  // anyway — this just removes the perceived lag).
+  const onDelete = async (sessionId: string): Promise<void> => {
+    if (mode === "cookie") {
+      await deleteManifestByCookie(boardId, sessionId);
+    } else if (mode === "token" && board) {
+      await deleteManifestByToken(board.token, sessionId);
+    } else {
+      throw new Error("not authenticated");
+    }
+    setManifests((prev) => prev.filter((m) => m.session_id !== sessionId));
+  };
+
+  // Archive — same shape as delete from the UI's POV (the card
+  // disappears from live), but the server preserves history. The
+  // user can find it in the archives view and replay it.
+  const onArchive = async (sessionId: string): Promise<void> => {
+    if (mode === "cookie") {
+      await archiveByCookie(boardId, sessionId);
+    } else if (mode === "token" && board) {
+      await archiveByToken(board.token, sessionId);
+    } else {
+      throw new Error("not authenticated");
+    }
+    setManifests((prev) => prev.filter((m) => m.session_id !== sessionId));
+  };
+
+  if (view === "archives") {
+    return (
+      <ArchivesView
+        boardId={boardId}
+        authMode={mode === "cookie" ? "cookie" : "token"}
+        board={board}
+        onClose={() => setView("live")}
+      />
+    );
+  }
+
   return (
     <Board
       boardId={boardId}
@@ -393,6 +443,9 @@ function BoardView({ boardId }: { boardId: string }): JSX.Element {
       refreshing={refreshing}
       lastRefreshed={lastRefreshed}
       authMode={mode}
+      onDelete={onDelete}
+      onArchive={onArchive}
+      onOpenArchives={() => setView("archives")}
     />
   );
 }
@@ -441,6 +494,7 @@ function TokenPrompt({
 
 function Board({
   boardId, manifests, onRefresh, refreshing, lastRefreshed, authMode,
+  onDelete, onArchive, onOpenArchives,
 }: {
   boardId: string;
   manifests: Manifest[];
@@ -448,6 +502,9 @@ function Board({
   refreshing: boolean;
   lastRefreshed: number;
   authMode: "cookie" | "token";
+  onDelete: (sessionId: string) => Promise<void>;
+  onArchive: (sessionId: string) => Promise<void>;
+  onOpenArchives: () => void;
 }): JSX.Element {
   const stageRef = useRef<HTMLDivElement>(null);
   const [dims, setDims] = useState<{ w: number; h: number }>({ w: 1200, h: 700 });
@@ -517,6 +574,7 @@ function Board({
             onRefresh={onRefresh} refreshing={refreshing} lastRefreshed={lastRefreshed}
             onResetLayout={resetLayout} hasOverrides={hasOverrides}
             authMode={authMode}
+            onOpenArchives={onOpenArchives}
           />
           <div className="odin-centre">
             <img src="/odin.png" alt="Odin" />
@@ -534,6 +592,7 @@ function Board({
           onRefresh={onRefresh} refreshing={refreshing} lastRefreshed={lastRefreshed}
           onResetLayout={resetLayout} hasOverrides={hasOverrides}
           authMode={authMode}
+          onOpenArchives={onOpenArchives}
         />
         <div className="odin-centre">
           <img src="/odin.png" alt="Odin" />
@@ -566,6 +625,8 @@ function Board({
             stageRef={stageRef}
             overridden={!!overrides[p.manifest.session_id]}
             onDragEnd={(x, y) => commitDrag(p.manifest.session_id, x, y)}
+            onDelete={() => onDelete(p.manifest.session_id)}
+            onArchive={() => onArchive(p.manifest.session_id)}
           />
         ))}
       </div>
@@ -576,7 +637,7 @@ function Board({
 // ----------------- toolbar (refresh + reset layout) -----------------
 
 function StageToolbar({
-  onRefresh, refreshing, lastRefreshed, onResetLayout, hasOverrides, authMode,
+  onRefresh, refreshing, lastRefreshed, onResetLayout, hasOverrides, authMode, onOpenArchives,
 }: {
   onRefresh: () => void;
   refreshing: boolean;
@@ -584,6 +645,7 @@ function StageToolbar({
   onResetLayout: () => void;
   hasOverrides: boolean;
   authMode: "cookie" | "token";
+  onOpenArchives: () => void;
 }): JSX.Element {
   // Force a re-render every 5 seconds so the "Xs ago" stamp stays
   // honest. (Anything coarser and the user can't tell whether the
@@ -620,6 +682,13 @@ function StageToolbar({
       >
         {refreshing ? "refreshing…" : "↻ refresh now"}
       </button>
+      <button
+        className="ghost"
+        onClick={onOpenArchives}
+        title="Show archived sessions — replay how they unfolded with a timeline scrubber"
+      >
+        📂 archives
+      </button>
       {hasOverrides ? (
         <button
           className="ghost"
@@ -636,12 +705,14 @@ function StageToolbar({
 // ----------------- card (with drag) -----------------
 
 function SessionCard({
-  card, stageRef, overridden, onDragEnd,
+  card, stageRef, overridden, onDragEnd, onDelete, onArchive,
 }: {
   card: LaidOutCard;
   stageRef: React.RefObject<HTMLDivElement>;
   overridden: boolean;
   onDragEnd: (x: number, y: number) => void;
+  onDelete: () => Promise<void>;
+  onArchive: () => Promise<void>;
 }): JSX.Element {
   const m = card.manifest;
   const cardRef = useRef<HTMLDivElement>(null);
@@ -705,6 +776,34 @@ function SessionCard({
     if (overridden) onDragEnd(card.x, card.y);   // parent will replace, but…
   };
 
+  // Delete affordance. Confirm-gated because there's no undo path on
+  // the server side — once deleted, the manifest is gone (the local
+  // ~/.claude-board/<id>.json is left alone; only the server row
+  // disappears, so a subsequent `push` would re-create the card).
+  const onDeleteClick = async (e: React.MouseEvent | React.PointerEvent): Promise<void> => {
+    e.stopPropagation();
+    const label = m.title || m.session_id;
+    if (!window.confirm(`Delete "${label}" from the board?\n\nThis nukes the live card AND all push history for replay. The local manifest at ~/.claude-board/${m.session_id}.json is left alone; a subsequent push would re-create the card from scratch.`)) return;
+    try {
+      await onDelete();
+    } catch (err) {
+      window.alert(`Couldn't delete: ${(err as Error).message}`);
+    }
+  };
+
+  // Archive affordance. Unlike delete, this preserves the full push
+  // history on the server — the session vanishes from the live board
+  // but the user can find it in the archives view and scrub through
+  // every push that led to its final state.
+  const onArchiveClick = async (e: React.MouseEvent | React.PointerEvent): Promise<void> => {
+    e.stopPropagation();
+    try {
+      await onArchive();
+    } catch (err) {
+      window.alert(`Couldn't archive: ${(err as Error).message}`);
+    }
+  };
+
   const chipClass =
     m.blocked_on_user ? "blocked" :
     m.status === "blocked" || m.status === "idle" ? m.status :
@@ -747,6 +846,22 @@ function SessionCard({
       <div className="head">
         <div className="title" title={m.title}>{m.title || "(untitled)"}</div>
         <span className={`chip ${chipClass}`}>{chipLabel}</span>
+        <button
+          type="button"
+          className="card-arch"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={onArchiveClick}
+          aria-label="Archive this session"
+          title="Archive this session — moves it to the archives view with full replay history"
+        >📦</button>
+        <button
+          type="button"
+          className="card-del"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={onDeleteClick}
+          aria-label="Delete this session"
+          title="Delete this session permanently (no replay history kept)"
+        >×</button>
       </div>
       {m.project ? <div className="head"><span className="project">{m.project}</span></div> : null}
       {m.current_chapter ? <div className="chapter">↳ {m.current_chapter}</div> : null}
@@ -820,16 +935,30 @@ function DeepLinks({ manifest: m }: { manifest: Manifest }): JSX.Element | null 
   // find it by name here and pick up where they left off. This is
   // the closest thing to a true "jump to this session" available
   // today, and it's the one that works on iOS / iPad too.
-  const webUrl = "https://claude.ai/code";
+  //
+  // On macOS the Claude desktop app registers the `claude://` URL
+  // scheme (verified in Claude.app/Contents/Info.plist), so we open
+  // there instead of the browser. We have to be careful to exclude
+  // iPadOS, which sets userAgent to "Macintosh" by default — distinguish
+  // by maxTouchPoints (real Macs have ≤1; iPads have 5+).
+  const isDesktopMac = typeof navigator !== "undefined"
+    && /Macintosh/.test(navigator.userAgent)
+    && (navigator.maxTouchPoints ?? 0) <= 1;
+  const webUrl = isDesktopMac ? "claude://code" : "https://claude.ai/code";
+  const webLabel = isDesktopMac ? "🌩 open in claude app" : "🌐 open in claude.ai";
+  const webTitle = isDesktopMac
+    ? "Open the Claude desktop app — find this session by name in the Remote Control list if you ran /rc."
+    : "Open claude.ai/code — finds this session by name if you ran /rc in it. Works on iOS / iPad / any browser.";
 
   if (!desktopUrl) {
     return (
       <div className="card-links">
         <a className="card-link primary" href={webUrl}
            onClick={stop} onPointerDown={stop}
-           target="_blank" rel="noreferrer"
-           title="Open claude.ai/code — find this session by name if you ran /rc">
-          🌐 open in claude.ai
+           target={isDesktopMac ? undefined : "_blank"}
+           rel={isDesktopMac ? undefined : "noreferrer"}
+           title={webTitle}>
+          {webLabel}
         </a>
       </div>
     );
@@ -839,9 +968,10 @@ function DeepLinks({ manifest: m }: { manifest: Manifest }): JSX.Element | null 
     <div className="card-links">
       <a className="card-link primary" href={webUrl}
          onClick={stop} onPointerDown={stop}
-         target="_blank" rel="noreferrer"
-         title="Open claude.ai/code — finds this session by name if you ran /rc in it. Works on iOS / iPad / any browser.">
-        🌐 open in claude.ai
+         target={isDesktopMac ? undefined : "_blank"}
+         rel={isDesktopMac ? undefined : "noreferrer"}
+         title={webTitle}>
+        {webLabel}
       </a>
       <a className="card-link" href={desktopUrl}
          onClick={stop} onPointerDown={stop}

@@ -211,10 +211,19 @@ def cmd_push(args: argparse.Namespace) -> int:
             except (ValueError, TypeError):
                 done_age_hours = 0
             if done_age_hours >= args.prune_after_hours:
-                # Delete from server (best-effort), then move locally.
-                _request("DELETE",
-                         f"{server}/api/manifests/{obj['session_id']}",
-                         token=cfg["token"])
+                # Archive on the server (preserves push history for
+                # replay), then move locally. Falls back to DELETE if
+                # the archive endpoint is missing (older server build)
+                # so this stays compatible with un-upgraded deployments.
+                arch_status, _ = _request(
+                    "POST",
+                    f"{server}/api/manifests/{obj['session_id']}/archive",
+                    token=cfg["token"],
+                )
+                if arch_status == 404 or arch_status >= 500:
+                    _request("DELETE",
+                             f"{server}/api/manifests/{obj['session_id']}",
+                             token=cfg["token"])
                 archive_dir.mkdir(parents=True, exist_ok=True)
                 try:
                     f.rename(archive_dir / f.name)
@@ -365,6 +374,128 @@ def cmd_watch(args: argparse.Namespace) -> int:
         time.sleep(interval)
 
 
+def cmd_bootstrap(args: argparse.Namespace) -> int:
+    """Called from the SessionStart hook. Reads the hook JSON on stdin
+    (per https://code.claude.com/docs/en/hooks the payload includes
+    session_id, cwd, source, …) and creates ~/.claude-board/<session_id>.json
+    with placeholder values so the board reflects this session before
+    the first user prompt.
+
+    Idempotent — re-running on the same session_id is a no-op. We only
+    act when `source == "startup"`; resume/clear/compact keep the same
+    session_id and reuse the original manifest.
+
+    Failures are silent: a broken hook must NOT crash a session. We
+    return 0 on every path that isn't a programming error."""
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, OSError, ValueError):
+        return 0
+
+    session_id = (payload.get("session_id") or "").strip()
+    if not session_id:
+        return 0
+
+    # Only the "startup" source represents a genuinely new session. The
+    # others (resume/clear/compact) reuse the same session_id, so a
+    # manifest should already exist — bootstrapping again would just
+    # clobber the live title/chapter with placeholders.
+    source = payload.get("source") or "startup"
+    if source != "startup":
+        return 0
+
+    MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
+    path = MANIFEST_DIR / f"{session_id}.json"
+    if path.exists():
+        # Race: Claude wrote the manifest before the hook fired, or a
+        # previous hook firing already bootstrapped. Either way, leave
+        # it alone.
+        return 0
+
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    cwd = (payload.get("cwd") or "").strip()
+    project = Path(cwd).name if cwd else None
+    obj: dict[str, Any] = {
+        "session_id":      session_id,
+        "title":           "new session",
+        "status":          "active",
+        "updated_at":      now,
+        "current_chapter": "starting up",
+    }
+    if project:
+        obj["project"] = project
+    if cwd:
+        obj["project_dir"] = cwd
+
+    path.write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8")
+    if args.verbose:
+        print(f"bootstrapped {session_id}")
+
+    # Push immediately so the card appears before Claude responds to
+    # the first prompt. Reuse cmd_push with --session-id so we only
+    # touch the row we just wrote (no contention with sibling sessions).
+    return cmd_push(argparse.Namespace(
+        session_id=session_id,
+        verbose=args.verbose,
+        no_archive=True,
+        prune_after_hours=1.0,
+    ))
+
+
+def _session_id_from_hook_stdin() -> str | None:
+    """Read the SessionStart / Stop / UserPromptSubmit hook payload from
+    stdin and pull out `session_id`. Returns None silently if stdin is
+    empty, not JSON, or doesn't carry that field — every caller wants
+    the same fallback (resolve by most-recent-mtime) when this happens,
+    and a broken hook must not crash a session."""
+    try:
+        if sys.stdin.isatty():
+            return None
+        raw = sys.stdin.read()
+        if not raw.strip():
+            return None
+        obj = json.loads(raw)
+        sid = (obj.get("session_id") or "").strip()
+        return sid or None
+    except (json.JSONDecodeError, OSError, ValueError):
+        return None
+
+
+def cmd_hook_stop(args: argparse.Namespace) -> int:
+    """End-of-turn hook entry point. Consumes the Stop-hook JSON on
+    stdin, extracts session_id, and runs ensure-blocked + push for
+    that specific session — so concurrent Claude sessions never cross
+    wires by writing each other's blocked_on_user.
+
+    Falls back to the "most recently modified manifest" heuristic if
+    stdin doesn't carry a session_id (manual invocation, or a hook
+    payload from a Claude Code version that doesn't pass session_id
+    on stdin)."""
+    sid = _session_id_from_hook_stdin()
+    # Same default reason cmd_ensure_blocked uses so manifests look
+    # consistent regardless of which entry point fired.
+    default_reason = "(awaiting your response — Claude ended the turn here)"
+    cmd_ensure_blocked(argparse.Namespace(
+        session_id=sid, reason=default_reason, verbose=args.verbose,
+    ))
+    return cmd_push(argparse.Namespace(
+        session_id=sid, verbose=args.verbose,
+        no_archive=False, prune_after_hours=1.0,
+    ))
+
+
+def cmd_hook_prompt(args: argparse.Namespace) -> int:
+    """User-just-submitted hook entry point. Mirror of hook-stop:
+    consume stdin, unblock the matching session, push it. Same stdin-
+    is-missing fallback semantics."""
+    sid = _session_id_from_hook_stdin()
+    cmd_unblock(argparse.Namespace(session_id=sid))
+    return cmd_push(argparse.Namespace(
+        session_id=sid, verbose=args.verbose,
+        no_archive=False, prune_after_hours=1.0,
+    ))
+
+
 def cmd_delete(args: argparse.Namespace) -> int:
     cfg = _read_config()
     if not cfg.get("token"):
@@ -443,6 +574,26 @@ def main(argv: list[str] | None = None) -> int:
     p_del = sub.add_parser("delete", help="Delete a session's manifest (local + server).")
     p_del.add_argument("session_id")
     p_del.set_defaults(func=cmd_delete)
+
+    p_boot = sub.add_parser("bootstrap",
+                            help="Create a manifest from SessionStart hook stdin (idempotent; source=startup only).")
+    p_boot.add_argument("-v", "--verbose", action="store_true")
+    p_boot.set_defaults(func=cmd_bootstrap)
+
+    # Consolidated hook entry points. They read session_id from stdin
+    # (the Claude Code hook JSON), so multiple concurrent sessions
+    # don't fight over each other's manifests. Old free-standing
+    # ensure-blocked / unblock / push subcommands stay around for
+    # manual invocation and back-compat.
+    p_hs = sub.add_parser("hook-stop",
+                          help="Stop hook: ensure-blocked + push for the session in stdin JSON.")
+    p_hs.add_argument("-v", "--verbose", action="store_true")
+    p_hs.set_defaults(func=cmd_hook_stop)
+
+    p_hp = sub.add_parser("hook-prompt",
+                          help="UserPromptSubmit hook: unblock + push for the session in stdin JSON.")
+    p_hp.add_argument("-v", "--verbose", action="store_true")
+    p_hp.set_defaults(func=cmd_hook_prompt)
 
     args = p.parse_args(argv)
     return args.func(args)
