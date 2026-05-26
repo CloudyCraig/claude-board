@@ -830,6 +830,63 @@ input[type="text"]:focus, input[type="url"]:focus { border-color: var(--odin); }
   line-height: 1.5;
 }
 
+/* ---- Manage-this-board popover (stage toolbar ⚙) ---- */
+.board-actions {
+  position: relative;
+}
+.board-actions-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 50;
+  min-width: 260px;
+  background: linear-gradient(180deg, #0d1230, #070a1f);
+  border: 1px solid var(--border, #1c2147);
+  border-radius: 10px;
+  box-shadow: 0 12px 40px #0008;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.board-actions-popover .popover-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 9px 12px;
+  font-size: 12px;
+  font-family: inherit;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text, #e6e9ff);
+  cursor: pointer;
+  text-align: left;
+  text-decoration: none;
+}
+.board-actions-popover .popover-item:hover {
+  background: #1c276655;
+  color: var(--odin-soft, #aab4ff);
+}
+.board-actions-popover .popover-item.danger:hover {
+  background: #2a0d0d80;
+  color: #ff8a8a;
+}
+.board-actions-popover .popover-item.link {
+  border-top: 1px solid var(--border, #1c2147);
+  margin-top: 4px;
+  padding-top: 10px;
+  color: var(--text-mute, #8b91b8);
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+}
+.board-actions-popover .popover-hint {
+  font-size: 10px;
+  color: var(--text-dim, #6a719c);
+  font-family: ui-monospace, monospace;
+}
+
 /* ---- New-token reveal modal (on /me regenerate) ---- */
 .new-token-overlay {
   position: fixed;

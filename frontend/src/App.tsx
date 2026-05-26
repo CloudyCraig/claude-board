@@ -2,10 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArchivesView } from "./Archives";
 import { LoginPage, MyAccountPage, RegisterPage } from "./Auth";
 import {
-  archiveByCookie, archiveByToken,
-  createBoard, deleteManifestByCookie, deleteManifestByToken,
+  archiveBoard, archiveByCookie, archiveByToken,
+  createBoard, deleteBoard, deleteManifestByCookie, deleteManifestByToken,
   fetchMe, fetchMyBoards, listManifests, listOwnedManifests,
-  logoutUser, subscribePolling,
+  logoutUser, regenerateBoardToken, subscribePolling,
 } from "./api";
 import { layout, ringFor, type LaidOutCard } from "./Layout";
 import {
@@ -367,6 +367,10 @@ function BoardView({ boardId }: { boardId: string }): JSX.Element {
   // the first render (mode==="probing") would skip it and the next
   // render would call it as an "extra" hook.
   const [view, setView] = useState<"live" | "archives">("live");
+  // Board-level regen-token modal state. Same shape as the one on /me;
+  // we lift it here so the manage menu in the stage toolbar can fire it
+  // without round-tripping to a different page.
+  const [newToken, setNewToken] = useState<{ board_id: string; token: string } | null>(null);
   const refreshRef = useRef<() => Promise<void>>(async () => {});
 
   // Probe: try cookie auth first. If 401/404 we fall back to token.
@@ -503,18 +507,80 @@ function BoardView({ boardId }: { boardId: string }): JSX.Element {
     );
   }
 
+  // ---- board-level actions (only sensible when signed in) ----
+  // These mirror the buttons on /me — duplicated here so a signed-in
+  // user managing their currently-viewed board doesn't have to leave
+  // the board view to archive / delete / regenerate. The post-action
+  // navigation in each handler is the bit that's different from /me:
+  // when you delete or archive the board you're currently ON, you
+  // need to be sent somewhere that still exists.
+  const onBoardArchive = async (): Promise<void> => {
+    if (!window.confirm("Archive this board?\n\nIt'll disappear from your dropdown but every session, history row, and archive inside it stays intact. You can unarchive it later from /me.")) return;
+    try {
+      await archiveBoard(boardId);
+      window.location.assign("/me");
+    } catch (e) {
+      window.alert(`Couldn't archive: ${(e as Error).message}`);
+    }
+  };
+
+  const onBoardDelete = async (): Promise<void> => {
+    if (!window.confirm("Delete this board forever?\n\nEvery session, history row, and archive inside it is also permanently deleted. This cannot be undone.\n\nIf you just want it out of sight, archive it instead.")) return;
+    try {
+      await deleteBoard(boardId);
+      window.location.assign("/me");
+    } catch (e) {
+      window.alert(`Couldn't delete: ${(e as Error).message}`);
+    }
+  };
+
+  const onBoardRegenerate = async (): Promise<void> => {
+    if (!window.confirm("Regenerate this board's bearer token?\n\nThe old token stops working immediately. Any machine still pushing with the old token will start getting 401s until you run `claude-board attach` with the new one.")) return;
+    try {
+      const r = await regenerateBoardToken(boardId);
+      setNewToken({ board_id: r.board_id, token: r.token });
+    } catch (e) {
+      window.alert(`Couldn't regenerate: ${(e as Error).message}`);
+    }
+  };
+
   return (
-    <Board
-      boardId={boardId}
-      manifests={manifests}
-      onRefresh={() => refreshRef.current()}
-      refreshing={refreshing}
-      lastRefreshed={lastRefreshed}
-      authMode={mode}
-      onDelete={onDelete}
-      onArchive={onArchive}
-      onOpenArchives={() => setView("archives")}
-    />
+    <>
+      <Board
+        boardId={boardId}
+        manifests={manifests}
+        onRefresh={() => refreshRef.current()}
+        refreshing={refreshing}
+        lastRefreshed={lastRefreshed}
+        authMode={mode}
+        onDelete={onDelete}
+        onArchive={onArchive}
+        onOpenArchives={() => setView("archives")}
+        onBoardArchive={onBoardArchive}
+        onBoardDelete={onBoardDelete}
+        onBoardRegenerate={onBoardRegenerate}
+      />
+      {newToken ? (
+        <div className="new-token-overlay" onClick={(e) => { if (e.target === e.currentTarget) setNewToken(null); }}>
+          <div className="new-token-card">
+            <h3 style={{ marginTop: 0 }}>New token for {newToken.board_id}</h3>
+            <div className="token-reveal">
+              <div className="label">Bearer token (shown once)</div>
+              <div>{newToken.token}</div>
+              <div className="warn">⚠ Save this now — the previous token is already invalid.</div>
+            </div>
+            <AttachCommand
+              boardId={newToken.board_id}
+              token={newToken.token}
+              label="Update your laptop's board.config"
+            />
+            <div style={{ marginTop: 16, textAlign: "right" }}>
+              <button onClick={() => setNewToken(null)}>done</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+    </>
   );
 }
 
@@ -563,6 +629,7 @@ function TokenPrompt({
 function Board({
   boardId, manifests, onRefresh, refreshing, lastRefreshed, authMode,
   onDelete, onArchive, onOpenArchives,
+  onBoardArchive, onBoardDelete, onBoardRegenerate,
 }: {
   boardId: string;
   manifests: Manifest[];
@@ -573,6 +640,9 @@ function Board({
   onDelete: (sessionId: string) => Promise<void>;
   onArchive: (sessionId: string) => Promise<void>;
   onOpenArchives: () => void;
+  onBoardArchive: () => Promise<void>;
+  onBoardDelete: () => Promise<void>;
+  onBoardRegenerate: () => Promise<void>;
 }): JSX.Element {
   const stageRef = useRef<HTMLDivElement>(null);
   const [dims, setDims] = useState<{ w: number; h: number }>({ w: 1200, h: 700 });
@@ -643,6 +713,9 @@ function Board({
             onResetLayout={resetLayout} hasOverrides={hasOverrides}
             authMode={authMode}
             onOpenArchives={onOpenArchives}
+            onBoardArchive={onBoardArchive}
+            onBoardDelete={onBoardDelete}
+            onBoardRegenerate={onBoardRegenerate}
           />
           <div className="odin-centre">
             <img src="/odin.png" alt="Odin" />
@@ -661,6 +734,9 @@ function Board({
           onResetLayout={resetLayout} hasOverrides={hasOverrides}
           authMode={authMode}
           onOpenArchives={onOpenArchives}
+          onBoardArchive={onBoardArchive}
+          onBoardDelete={onBoardDelete}
+          onBoardRegenerate={onBoardRegenerate}
         />
         <div className="odin-centre">
           <img src="/odin.png" alt="Odin" />
@@ -706,6 +782,7 @@ function Board({
 
 function StageToolbar({
   onRefresh, refreshing, lastRefreshed, onResetLayout, hasOverrides, authMode, onOpenArchives,
+  onBoardArchive, onBoardDelete, onBoardRegenerate,
 }: {
   onRefresh: () => void;
   refreshing: boolean;
@@ -714,6 +791,9 @@ function StageToolbar({
   hasOverrides: boolean;
   authMode: "cookie" | "token";
   onOpenArchives: () => void;
+  onBoardArchive: () => Promise<void>;
+  onBoardDelete: () => Promise<void>;
+  onBoardRegenerate: () => Promise<void>;
 }): JSX.Element {
   // Force a re-render every 5 seconds so the "Xs ago" stamp stays
   // honest. (Anything coarser and the user can't tell whether the
@@ -765,6 +845,89 @@ function StageToolbar({
         >
           reset layout
         </button>
+      ) : null}
+      {/* Board-level management. Only meaningful for signed-in
+          owners — the server's archive/delete/regenerate endpoints
+          are cookie-auth. Token-mode users (anonymous bearer) see
+          nothing here and should manage via /me after signing in. */}
+      {authMode === "cookie" ? (
+        <BoardActionsMenu
+          onBoardArchive={onBoardArchive}
+          onBoardDelete={onBoardDelete}
+          onBoardRegenerate={onBoardRegenerate}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * Stage-toolbar manage-this-board menu. A small popover with the
+ * board-level actions the user used to have to go to /me to find:
+ * regenerate token, archive board, delete board. Click-outside +
+ * Escape dismiss. Same actions exist on /me — this is the "I'm right
+ * here on the board, don't make me navigate" shortcut.
+ */
+function BoardActionsMenu({
+  onBoardArchive, onBoardDelete, onBoardRegenerate,
+}: {
+  onBoardArchive: () => Promise<void>;
+  onBoardDelete: () => Promise<void>;
+  onBoardRegenerate: () => Promise<void>;
+}): JSX.Element {
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  // Click-outside + Escape both dismiss. Pointer-down (not click) so
+  // we close before the click handlers on the trigger button fire.
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    window.addEventListener("mousedown", onDown);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  const fire = (handler: () => Promise<void>) => () => {
+    setOpen(false);
+    handler();
+  };
+
+  return (
+    <div className="board-actions" ref={wrapRef}>
+      <button
+        className="ghost"
+        onClick={() => setOpen((o) => !o)}
+        title="Manage this board — archive, delete, regenerate token"
+      >
+        ⚙ manage
+      </button>
+      {open ? (
+        <div className="board-actions-popover" role="menu">
+          <button className="popover-item" role="menuitem" onClick={fire(onBoardRegenerate)}>
+            🔁 regenerate token
+            <span className="popover-hint">new bearer for board.config</span>
+          </button>
+          <button className="popover-item" role="menuitem" onClick={fire(onBoardArchive)}>
+            📥 archive board
+            <span className="popover-hint">hide from list; preserve everything</span>
+          </button>
+          <button className="popover-item danger" role="menuitem" onClick={fire(onBoardDelete)}>
+            🗑 delete board
+            <span className="popover-hint">permanent — cascades to sessions + history</span>
+          </button>
+          <a href="/me" className="popover-item link" role="menuitem">
+            All my boards →
+          </a>
+        </div>
       ) : null}
     </div>
   );
