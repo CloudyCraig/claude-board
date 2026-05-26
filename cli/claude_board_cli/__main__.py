@@ -296,6 +296,38 @@ def cmd_unblock(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ensure_blocked(args: argparse.Namespace) -> int:
+    """Default-on safety net for the 'I asked a chat question without
+    calling block' failure mode. If the current session's manifest is
+    neither already-blocked nor status=done, flip it to blocked with a
+    generic reason so the board correctly shows 'NEEDS YOU' between
+    turns. Anything Claude blocked explicitly with a specific reason
+    is left alone (we only fill the gap when nothing else flagged it).
+
+    The Stop hook chains this in front of `push`, so every assistant
+    turn ends with the card honest about whether the ball's in the
+    user's court — without Claude having to remember.
+    """
+    p = _resolve_session_id(args.session_id)
+    if p is None:
+        return 0     # nothing to do — silent
+    try:
+        obj = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    if obj.get("status") == "done":
+        return 0
+    if obj.get("blocked_on_user"):
+        return 0     # Claude flagged this turn with a specific reason
+    _update_manifest(p, {
+        "blocked_on_user": True,
+        "blocked_reason":  args.reason,
+    })
+    if args.verbose:
+        print(f"auto-blocked {p.stem}")
+    return 0
+
+
 def cmd_chapter(args: argparse.Namespace) -> int:
     """Set current_chapter on the current session. Handy when you mark
     a new chapter via the IDE skill — call this in the same breath so
@@ -389,6 +421,14 @@ def main(argv: list[str] | None = None) -> int:
     p_unblock = sub.add_parser("unblock", help="Clear blocked-on-user for the current session.")
     p_unblock.add_argument("--session-id", default=None)
     p_unblock.set_defaults(func=cmd_unblock)
+
+    p_ensure = sub.add_parser("ensure-blocked",
+                              help="Safety-net: block the current session if it's not already blocked + not done. Stop-hook calls this.")
+    p_ensure.add_argument("--session-id", default=None)
+    p_ensure.add_argument("--reason", default="(awaiting your response — Claude ended the turn here)",
+                          help="Reason shown when nothing else flagged this turn")
+    p_ensure.add_argument("-v", "--verbose", action="store_true")
+    p_ensure.set_defaults(func=cmd_ensure_blocked)
 
     p_chapter = sub.add_parser("chapter", help="Set current_chapter on the current session.")
     p_chapter.add_argument("text", help="The chapter title")

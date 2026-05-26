@@ -806,23 +806,30 @@ function DeepLinks({ manifest: m }: { manifest: Manifest }): JSX.Element | null 
 
   const dir = m.project_dir;
   const chapter = m.current_chapter || "session";
-  // claude-cli://open takes either `cwd=` (absolute path) or
-  // `repo=owner/name`. We have the path; the chapter becomes the
-  // resume prompt the new Claude Code session opens with.
+  // `claude-cli://open` only mints NEW Claude Code CLI sessions —
+  // there's no documented scheme to focus the specific running one
+  // (tracked at anthropics/claude-code#47018 + #25642 + #44607).
+  // So we label this pill honestly as "new session here": click =
+  // a fresh Claude Code in the right project folder, with the
+  // session's current_chapter as the opening prompt.
   const desktopUrl = dir
     ? `claude-cli://open?cwd=${encodeURIComponent(dir)}&q=${encodeURIComponent(`Resume — ${chapter}`)}`
     : null;
+  // claude.ai/code is where Remote-Control-enabled sessions show
+  // up — IF the user has run /rc in their CLI session, they can
+  // find it by name here and pick up where they left off. This is
+  // the closest thing to a true "jump to this session" available
+  // today, and it's the one that works on iOS / iPad too.
   const webUrl = "https://claude.ai/code";
 
   if (!desktopUrl) {
-    // No project dir → only the catch-all browser link makes sense.
     return (
       <div className="card-links">
-        <a className="card-link" href={webUrl}
+        <a className="card-link primary" href={webUrl}
            onClick={stop} onPointerDown={stop}
            target="_blank" rel="noreferrer"
-           title="Open the claude.ai sessions list (any device)">
-          🌐 claude.ai/code
+           title="Open claude.ai/code — find this session by name if you ran /rc">
+          🌐 open in claude.ai
         </a>
       </div>
     );
@@ -830,16 +837,16 @@ function DeepLinks({ manifest: m }: { manifest: Manifest }): JSX.Element | null 
 
   return (
     <div className="card-links">
-      <a className="card-link" href={desktopUrl}
-         onClick={stop} onPointerDown={stop}
-         title={`Open Claude Code in ${dir}`}>
-        ↗ claude code
-      </a>
-      <a className="card-link" href={webUrl}
+      <a className="card-link primary" href={webUrl}
          onClick={stop} onPointerDown={stop}
          target="_blank" rel="noreferrer"
-         title="Open the claude.ai sessions list (works on iOS / iPad / any browser)">
-        🌐 claude.ai
+         title="Open claude.ai/code — finds this session by name if you ran /rc in it. Works on iOS / iPad / any browser.">
+        🌐 open in claude.ai
+      </a>
+      <a className="card-link" href={desktopUrl}
+         onClick={stop} onPointerDown={stop}
+         title={`Spawn a NEW Claude Code session in ${dir} with a "resume" prompt. Not the same as focusing the running one — Anthropic hasn't shipped session-resume URLs yet.`}>
+        ↗ new session here
       </a>
     </div>
   );
