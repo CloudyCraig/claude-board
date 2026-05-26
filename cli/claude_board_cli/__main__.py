@@ -23,7 +23,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 import time
 import urllib.error
@@ -32,26 +31,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-# Claude Code session_ids are RFC-4122 UUIDs. We use this to decide
-# whether a manifest's session_id is the kind we can derive a Remote
-# Control URL for — claude.ai routes /code/<uuid> as a Universal Link
-# to the desktop app (per its apple-app-site-association), but only
-# session URLs of this shape. ULID-style legacy IDs from hand-bootstrap
-# don't match and are left alone.
-_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
-
-
-def _derive_claude_url(session_id: str) -> str | None:
-    """Build the claude.ai Remote Control URL for a Claude Code session,
-    or None if the session_id doesn't look like one we can derive for.
-
-    Format confirmed by inspecting Claude Code's transcript JSONL and
-    verified against claude.ai's AASA file — `/code/*` is in the
-    `applinks` allow-list, so this URL Universal-Links to Claude.app
-    on macOS / iPad when clicked from a non-browser context."""
-    if session_id and _UUID_RE.match(session_id):
-        return f"https://claude.ai/code/{session_id}"
-    return None
+# Note (post-mortem): an earlier commit tried to auto-derive a claude.ai
+# Remote Control URL from the local session_id, on the theory that the
+# URL was `https://claude.ai/code/<session_id>`. That turned out to be
+# wrong — the local Claude Code session_id is NOT what claude.ai puts
+# in the /code/<id> URL, so the derived URL 404'd. Reverted; users
+# who want a session-specific link still set `claude_url` by hand on
+# their manifest, and the card's DeepLinks component honours it
+# verbatim when present. See commit history for the failed attempt.
 
 CONFIG_PATH    = Path(os.path.expanduser("~/.claude/board.config"))
 MANIFEST_DIR   = Path(os.path.expanduser("~/.claude-board"))
@@ -218,18 +205,6 @@ def cmd_push(args: argparse.Namespace) -> int:
                 obj["project_dir"] = os.path.realpath(os.getcwd())
             except OSError:
                 pass
-
-        # Auto-fill claude_url for Claude-Code-shaped session_ids when
-        # the field is ABSENT. We deliberately use "key not in obj" not
-        # "obj.get('claude_url')" so explicit user choices stick:
-        #   • field missing → derive it (covers manifests that predate
-        #     the auto-fill, e.g. ones bootstrapped before this commit)
-        #   • field == ""    → user explicitly opted out, leave it
-        #   • field == "..." → user pasted a custom URL, leave it
-        if "claude_url" not in obj:
-            derived = _derive_claude_url(obj.get("session_id", ""))
-            if derived:
-                obj["claude_url"] = derived
 
         # Auto-archive: a manifest marked "done" gets a grace period
         # on the board (so the user sees the final state), then we
@@ -460,16 +435,6 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
         obj["project"] = project
     if cwd:
         obj["project_dir"] = cwd
-    # claude.ai Remote Control URL for this session — clicking it from
-    # the card's "open in claude" badge routes to Claude.app on macOS
-    # via Universal Links (because /code/<uuid> is in claude.ai's AASA
-    # allow-list). Only set for UUID-shaped Claude Code session_ids;
-    # ULID-style IDs from hand-bootstrap don't map to a real claude.ai
-    # endpoint. The user can override or empty this field by hand-
-    # editing the manifest, and subsequent pushes preserve it.
-    url = _derive_claude_url(session_id)
-    if url:
-        obj["claude_url"] = url
 
     path.write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8")
     if args.verbose:
