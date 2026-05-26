@@ -784,6 +784,98 @@ input[type="text"]:focus, input[type="url"]:focus { border-color: var(--odin); }
   color: var(--odin-soft);
 }
 
+/* ---- My Account: boards management ---- */
+.boards-manage { max-width: 900px; }
+.boards-manage-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin: 24px 0 12px;
+}
+.boards-manage .archived-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  user-select: none;
+}
+.boards-manage .archived-toggle input { cursor: pointer; }
+
+.boards-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.boards-table th, .boards-table td {
+  text-align: left;
+  padding: 10px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.boards-table th {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-mute);
+  font-weight: 500;
+}
+.boards-table th.num,
+.boards-table td.num    { text-align: right; font-variant-numeric: tabular-nums; }
+.boards-table th.actions,
+.boards-table td.actions { text-align: right; white-space: nowrap; }
+.boards-table tr.archived td { opacity: 0.55; }
+.boards-table .board-link {
+  text-decoration: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.boards-table .board-link:hover .board-note { color: var(--odin-soft); }
+.boards-table .board-note {
+  color: var(--text);
+  font-weight: 500;
+  transition: color 0.12s;
+}
+.boards-table .board-id {
+  font-size: 10px;
+  color: var(--text-dim);
+  font-family: ui-monospace, monospace;
+}
+.boards-table .badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 6px;
+  font-size: 9px;
+  font-family: ui-monospace, monospace;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  border-radius: 3px;
+  background: #2a1a0a99;
+  color: var(--warn, #f5b454);
+  vertical-align: middle;
+}
+.boards-table button.ghost {
+  font-size: 11px;
+  padding: 4px 10px;
+  margin-left: 6px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-mute);
+}
+.boards-table button.ghost:hover {
+  border-color: var(--odin, #6e7bf2);
+  color: var(--odin-soft, #aab4ff);
+}
+.boards-table button.ghost.danger:hover {
+  border-color: #d65555;
+  color: #ff8a8a;
+  background: #2a0d0d80;
+}
+.boards-table button.ghost:disabled {
+  opacity: 0.5;
+  cursor: progress;
+}
+
 .empty {
   text-align: center;
   color: var(--text-mute);

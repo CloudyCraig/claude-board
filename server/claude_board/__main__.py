@@ -224,6 +224,14 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE boards ADD COLUMN owner_user_id TEXT DEFAULT NULL",
         "boards.owner_user_id",
     ),
+    (
+        # Flips when the owner hides a board from their default list.
+        # Sessions inside an archived board still exist on the server;
+        # the flag is purely a UI/discovery concern. Set/cleared via
+        # POST /api/boards/{id}/archive and /unarchive.
+        "ALTER TABLE boards ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+        "boards.archived",
+    ),
 ]
 
 
@@ -701,21 +709,51 @@ def _build_app() -> FastAPI:
         return user
 
     @app.get("/api/users/me/boards")
-    async def my_boards(user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
+    async def my_boards(
+        user: dict[str, Any] = Depends(require_user),
+        include_archived: bool = False,
+    ) -> dict[str, Any]:
+        # We compute session_count + archived_session_count + last_activity
+        # in a single LEFT JOIN'd query so the management page can show
+        # "what's in this board" without N+1 round-trips. last_activity
+        # is the most recent push across live or archived rows — gives
+        # the user a real "last touched" signal even after a board's
+        # live cards have all aged out.
+        sql = """
+            SELECT b.board_id, b.created_at, b.last_seen, b.note, b.archived,
+                   COALESCE(live.n, 0)    AS live_count,
+                   COALESCE(arch.n, 0)    AS archived_count,
+                   COALESCE(live.last, arch.last) AS last_activity
+            FROM boards b
+            LEFT JOIN (
+                SELECT board_id, COUNT(*) AS n, MAX(updated_at) AS last
+                FROM manifests GROUP BY board_id
+            ) live ON live.board_id = b.board_id
+            LEFT JOIN (
+                SELECT board_id, COUNT(*) AS n, MAX(archived_at) AS last
+                FROM archives GROUP BY board_id
+            ) arch ON arch.board_id = b.board_id
+            WHERE b.owner_user_id = ?
+        """
+        params: list[Any] = [user["user_id"]]
+        if not include_archived:
+            sql += " AND COALESCE(b.archived, 0) = 0"
+        sql += " ORDER BY b.created_at DESC"
+
         with _open_db() as conn:
-            rows = conn.execute(
-                "SELECT board_id, created_at, last_seen, note FROM boards "
-                "WHERE owner_user_id = ? ORDER BY created_at DESC",
-                (user["user_id"],),
-            ).fetchall()
+            rows = conn.execute(sql, params).fetchall()
         return {
             "items": [
                 {
-                    "board_id":   r["board_id"],
-                    "created_at": r["created_at"],
-                    "last_seen":  r["last_seen"],
-                    "note":       r["note"],
-                    "url":        f"/b/{r['board_id']}",
+                    "board_id":              r["board_id"],
+                    "created_at":            r["created_at"],
+                    "last_seen":             r["last_seen"],
+                    "note":                  r["note"],
+                    "archived":              bool(r["archived"]),
+                    "live_session_count":    int(r["live_count"]),
+                    "archived_session_count": int(r["archived_count"]),
+                    "last_activity":         r["last_activity"],
+                    "url":                   f"/b/{r['board_id']}",
                 }
                 for r in rows
             ],
@@ -999,6 +1037,64 @@ def _build_app() -> FastAPI:
             # don't own it" from "this board doesn't exist".
             raise HTTPException(status_code=404, detail="board not found")
         return dict(row)
+
+    @app.post("/api/boards/{board_id}/archive")
+    async def archive_board(
+        board_id: str,
+        user: dict[str, Any] = Depends(require_user),
+    ) -> dict[str, Any]:
+        """Hide a board from the owner's default list. Idempotent. All
+        sessions / history / archives inside the board are untouched —
+        unarchiving restores the board with everything intact."""
+        _require_owned_board(board_id, user)
+        with _open_db() as conn:
+            conn.execute(
+                "UPDATE boards SET archived = 1 WHERE board_id = ?",
+                (board_id,),
+            )
+        return {"ok": True}
+
+    @app.post("/api/boards/{board_id}/unarchive")
+    async def unarchive_board(
+        board_id: str,
+        user: dict[str, Any] = Depends(require_user),
+    ) -> dict[str, Any]:
+        _require_owned_board(board_id, user)
+        with _open_db() as conn:
+            conn.execute(
+                "UPDATE boards SET archived = 0 WHERE board_id = ?",
+                (board_id,),
+            )
+        return {"ok": True}
+
+    @app.delete("/api/boards/{board_id}")
+    async def delete_board(
+        board_id: str,
+        user: dict[str, Any] = Depends(require_user),
+    ) -> dict[str, Any]:
+        """Cascade-delete EVERYTHING that references this board_id, then
+        the board itself. Irreversible — there's no soft-delete here.
+        Use POST /archive instead if the owner might want to come back.
+
+        All four DELETE statements are wrapped in one BEGIN IMMEDIATE so
+        a concurrent push for the same board can't slip a manifest row
+        in between the cascade and the board removal (which would leave
+        an orphan row that the next listing query would silently hide
+        but the storage would still hold)."""
+        _require_owned_board(board_id, user)
+        with _open_db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("DELETE FROM manifest_history WHERE board_id = ?", (board_id,))
+                conn.execute("DELETE FROM archives        WHERE board_id = ?", (board_id,))
+                conn.execute("DELETE FROM manifests       WHERE board_id = ?", (board_id,))
+                conn.execute("DELETE FROM boards          WHERE board_id = ?", (board_id,))
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        PUBSUB.publish(board_id, "board-deleted")
+        return {"ok": True}
 
     @app.get("/api/boards/{board_id}/manifests")
     async def list_manifests_for_owned(

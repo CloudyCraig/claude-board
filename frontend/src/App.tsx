@@ -936,27 +936,26 @@ function DeepLinks({ manifest: m }: { manifest: Manifest }): JSX.Element | null 
   // the closest thing to a true "jump to this session" available
   // today, and it's the one that works on iOS / iPad too.
   //
-  // On macOS the Claude desktop app registers the `claude://` URL
-  // scheme (verified in Claude.app/Contents/Info.plist), so we open
-  // there instead of the browser. We have to be careful to exclude
-  // iPadOS, which sets userAgent to "Macintosh" by default — distinguish
-  // by maxTouchPoints (real Macs have ≤1; iPads have 5+).
-  const isDesktopMac = typeof navigator !== "undefined"
-    && /Macintosh/.test(navigator.userAgent)
-    && (navigator.maxTouchPoints ?? 0) <= 1;
-  const webUrl = isDesktopMac ? "claude://code" : "https://claude.ai/code";
-  const webLabel = isDesktopMac ? "🌩 open in claude app" : "🌐 open in claude.ai";
-  const webTitle = isDesktopMac
-    ? "Open the Claude desktop app — find this session by name in the Remote Control list if you ran /rc."
-    : "Open claude.ai/code — finds this session by name if you ran /rc in it. Works on iOS / iPad / any browser.";
+  // We tried `claude://code` on macOS to route into the Claude
+  // desktop app (which does register the `claude://` scheme), but
+  // the desktop app has no handler for a `/code` path — the click
+  // just focused the app silently with nothing visible happening,
+  // which read as broken. There's no public deep-link scheme to
+  // open the Claude Code session list inside the desktop app, so
+  // routing to claude.ai/code in the user's browser remains the
+  // best available "find this session" surface on every platform.
+  // The desktop app can be set as the default handler for that URL
+  // via the user's browser if they prefer; that decision is theirs.
+  const webUrl   = "https://claude.ai/code";
+  const webLabel = "🌐 open in claude.ai";
+  const webTitle = "Open claude.ai/code — finds this session by name if you ran /rc in it. On macOS you can set the desktop app as the default handler for this URL in your browser.";
 
   if (!desktopUrl) {
     return (
       <div className="card-links">
         <a className="card-link primary" href={webUrl}
            onClick={stop} onPointerDown={stop}
-           target={isDesktopMac ? undefined : "_blank"}
-           rel={isDesktopMac ? undefined : "noreferrer"}
+           target="_blank" rel="noreferrer"
            title={webTitle}>
           {webLabel}
         </a>
@@ -968,8 +967,7 @@ function DeepLinks({ manifest: m }: { manifest: Manifest }): JSX.Element | null 
     <div className="card-links">
       <a className="card-link primary" href={webUrl}
          onClick={stop} onPointerDown={stop}
-         target={isDesktopMac ? undefined : "_blank"}
-         rel={isDesktopMac ? undefined : "noreferrer"}
+         target="_blank" rel="noreferrer"
          title={webTitle}>
         {webLabel}
       </a>

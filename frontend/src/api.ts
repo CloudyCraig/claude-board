@@ -62,10 +62,37 @@ export async function fetchMe(): Promise<User | null> {
   return jsonOrThrow<User>(r, "fetch me");
 }
 
-export async function fetchMyBoards(): Promise<UserBoard[]> {
-  const r = await fetch("/api/users/me/boards", { credentials: "include" });
+export async function fetchMyBoards(includeArchived = false): Promise<UserBoard[]> {
+  const qs = includeArchived ? "?include_archived=true" : "";
+  const r = await fetch(`/api/users/me/boards${qs}`, { credentials: "include" });
   const data = await jsonOrThrow<{ items: UserBoard[] }>(r, "list my boards");
   return data.items;
+}
+
+// ----- Board-level archive / unarchive / delete (cookie-auth, owner-only) -----
+
+export async function archiveBoard(boardId: string): Promise<void> {
+  const r = await fetch(`/api/boards/${encodeURIComponent(boardId)}/archive`, {
+    method: "POST", credentials: "include",
+  });
+  if (!r.ok) throw new Error(`archive board: ${r.status}`);
+}
+
+export async function unarchiveBoard(boardId: string): Promise<void> {
+  const r = await fetch(`/api/boards/${encodeURIComponent(boardId)}/unarchive`, {
+    method: "POST", credentials: "include",
+  });
+  if (!r.ok) throw new Error(`unarchive board: ${r.status}`);
+}
+
+/** Cascade-delete a board AND every manifest, history row, and session
+ *  archive inside it. Irreversible — caller is responsible for
+ *  confirming with the user first. */
+export async function deleteBoard(boardId: string): Promise<void> {
+  const r = await fetch(`/api/boards/${encodeURIComponent(boardId)}`, {
+    method: "DELETE", credentials: "include",
+  });
+  if (!r.ok) throw new Error(`delete board: ${r.status}`);
 }
 
 export async function listManifests(token: string): Promise<{ items: Manifest[]; board_id: string }> {

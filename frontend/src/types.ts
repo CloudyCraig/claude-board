@@ -84,6 +84,13 @@ export interface UserBoard {
   note:       string;
   created_at: string;
   last_seen:  string;
+  /** Server-set since the board-management work. Older endpoint
+   *  responses won't carry these — frontend treats undefined as
+   *  "unknown, hide the column" rather than zero. */
+  archived?:                boolean;
+  live_session_count?:      number;
+  archived_session_count?:  number;
+  last_activity?:           string | null;
 }
 
 export interface RegisterPayload {

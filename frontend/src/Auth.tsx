@@ -15,9 +15,10 @@
  *    per Craig's wording.
  */
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
-  fetchMe, fetchMyBoards, loginUser, logoutUser, registerUser,
+  archiveBoard, deleteBoard, fetchMe, fetchMyBoards, loginUser,
+  logoutUser, registerUser, unarchiveBoard,
 } from "./api";
 import type { User, UserBoard } from "./types";
 
@@ -181,6 +182,22 @@ export function MyAccountPage(): JSX.Element {
   const [user, setUser] = useState<User | null | undefined>(undefined);
   const [boards, setBoards] = useState<UserBoard[]>([]);
   const [err, setErr] = useState("");
+  const [showArchived, setShowArchived] = useState(false);
+  // Per-row pending state for visual feedback. Keyed by board_id so a
+  // slow delete doesn't block other rows from being acted on. We
+  // intentionally don't reuse a single global flag — boards are
+  // independent and the user might want to fire off multiple actions.
+  const [pending, setPending] = useState<Record<string, "archiving" | "unarchiving" | "deleting" | undefined>>({});
+
+  const refresh = useCallback(async (includeArchived: boolean) => {
+    try {
+      const bs = await fetchMyBoards(includeArchived);
+      setBoards(bs);
+      setErr("");
+    } catch (ex) {
+      setErr((ex as Error).message);
+    }
+  }, []);
 
   useEffect(() => {
     let stopped = false;
@@ -196,13 +213,16 @@ export function MyAccountPage(): JSX.Element {
           return;
         }
         setUser(me);
-        const bs = await fetchMyBoards();
-        if (!stopped) setBoards(bs);
+        await refresh(showArchived);
       } catch (ex) {
         if (!stopped) setErr((ex as Error).message);
       }
     })();
     return () => { stopped = true; };
+    // We deliberately don't depend on showArchived here; the toggle
+    // handler below calls refresh() explicitly so we can mark pending
+    // state without racing this effect.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   if (user === undefined) {
@@ -215,9 +235,63 @@ export function MyAccountPage(): JSX.Element {
     window.location.assign("/");
   };
 
+  const onToggleArchived = async (): Promise<void> => {
+    const next = !showArchived;
+    setShowArchived(next);
+    await refresh(next);
+  };
+
+  const setBusy = (id: string, kind: "archiving" | "unarchiving" | "deleting" | undefined) =>
+    setPending((p) => ({ ...p, [id]: kind }));
+
+  const onArchive = async (b: UserBoard): Promise<void> => {
+    setBusy(b.board_id, "archiving");
+    try {
+      await archiveBoard(b.board_id);
+      await refresh(showArchived);
+    } catch (ex) {
+      window.alert(`Couldn't archive: ${(ex as Error).message}`);
+    } finally {
+      setBusy(b.board_id, undefined);
+    }
+  };
+
+  const onUnarchive = async (b: UserBoard): Promise<void> => {
+    setBusy(b.board_id, "unarchiving");
+    try {
+      await unarchiveBoard(b.board_id);
+      await refresh(showArchived);
+    } catch (ex) {
+      window.alert(`Couldn't unarchive: ${(ex as Error).message}`);
+    } finally {
+      setBusy(b.board_id, undefined);
+    }
+  };
+
+  const onDelete = async (b: UserBoard): Promise<void> => {
+    const label = b.note || b.board_id;
+    const live = b.live_session_count ?? 0;
+    const arch = b.archived_session_count ?? 0;
+    const inventory = (live || arch)
+      ? `\n\nThis will also permanently delete ${live} live session${live === 1 ? "" : "s"} and ${arch} archived session${arch === 1 ? "" : "s"} (including their replay history).`
+      : "";
+    if (!window.confirm(`Delete board "${label}" forever?${inventory}\n\nThis cannot be undone. If you just want to hide it, archive it instead.`)) {
+      return;
+    }
+    setBusy(b.board_id, "deleting");
+    try {
+      await deleteBoard(b.board_id);
+      await refresh(showArchived);
+    } catch (ex) {
+      window.alert(`Couldn't delete: ${(ex as Error).message}`);
+    } finally {
+      setBusy(b.board_id, undefined);
+    }
+  };
+
   return (
     <main className="landing">
-      <section className="create" style={{ maxWidth: 680 }}>
+      <section className="create boards-manage">
         <h2 style={{ marginTop: 0 }}>
           Welcome back, {user.name || user.email}
         </h2>
@@ -226,26 +300,91 @@ export function MyAccountPage(): JSX.Element {
           {user.marketing_opt_in ? " · subscribed to product news" : ""}
         </p>
 
-        <h3 style={{ marginTop: 24 }}>Your boards</h3>
+        <div className="boards-manage-head">
+          <h3 style={{ margin: 0 }}>Your boards</h3>
+          <label className="meta archived-toggle">
+            <input
+              type="checkbox"
+              checked={showArchived}
+              onChange={onToggleArchived}
+            />
+            show archived
+          </label>
+        </div>
+
         {err ? <div className="error-banner">{err}</div> : null}
         {boards.length === 0 ? (
           <p style={{ color: "var(--text-mute)" }}>
-            No boards yet. <a href="/">Mint your first one</a> — when you're
-            signed in, the new board is attached to your account
-            automatically.
+            {showArchived
+              ? "No boards at all yet."
+              : <>No active boards. <a href="/">Mint one</a> — when signed in, it's attached to your account automatically.</>}
           </p>
         ) : (
-          <ul style={{ paddingLeft: 18, lineHeight: 1.9 }}>
-            {boards.map((b) => (
-              <li key={b.board_id}>
-                <a href={b.url}><code>{b.board_id}</code></a>
-                {b.note ? <> — {b.note}</> : null}
-                <span style={{ color: "var(--text-mute)", marginLeft: 8, fontSize: 12 }}>
-                  created {b.created_at.slice(0, 10)}
-                </span>
-              </li>
-            ))}
-          </ul>
+          <table className="boards-table">
+            <thead>
+              <tr>
+                <th>Board</th>
+                <th className="num" title="Live sessions / Archived sessions">Sessions</th>
+                <th>Last activity</th>
+                <th>Created</th>
+                <th className="actions">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {boards.map((b) => {
+                const live = b.live_session_count ?? 0;
+                const archived = b.archived_session_count ?? 0;
+                const busy = pending[b.board_id];
+                return (
+                  <tr key={b.board_id} className={b.archived ? "archived" : ""}>
+                    <td>
+                      <a href={b.url} className="board-link">
+                        <span className="board-note">{b.note || "(no note)"}</span>
+                        <code className="board-id">{b.board_id}</code>
+                      </a>
+                      {b.archived ? <span className="badge archived">archived</span> : null}
+                    </td>
+                    <td className="num">
+                      <span title="Live sessions on the board">{live}</span>
+                      <span className="meta"> · </span>
+                      <span className="meta" title="Archived sessions (replay history retained)">{archived}</span>
+                    </td>
+                    <td className="meta">{b.last_activity ? b.last_activity.slice(0, 16).replace("T", " ") : "—"}</td>
+                    <td className="meta">{b.created_at.slice(0, 10)}</td>
+                    <td className="actions">
+                      {b.archived ? (
+                        <button
+                          className="ghost"
+                          disabled={!!busy}
+                          onClick={() => onUnarchive(b)}
+                          title="Restore this board to your active list"
+                        >
+                          {busy === "unarchiving" ? "…" : "unarchive"}
+                        </button>
+                      ) : (
+                        <button
+                          className="ghost"
+                          disabled={!!busy}
+                          onClick={() => onArchive(b)}
+                          title="Hide this board from your active list (sessions stay intact, you can unarchive later)"
+                        >
+                          {busy === "archiving" ? "…" : "archive"}
+                        </button>
+                      )}
+                      <button
+                        className="ghost danger"
+                        disabled={!!busy}
+                        onClick={() => onDelete(b)}
+                        title="Permanently delete this board and every session, history row, and archive inside it"
+                      >
+                        {busy === "deleting" ? "…" : "delete"}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
         )}
         <div style={{ marginTop: 24, display: "flex", gap: 12 }}>
           <a href="/"><button>create another board</button></a>
