@@ -409,6 +409,38 @@ input[type="text"]:focus, input[type="url"]:focus { border-color: var(--odin); }
   box-shadow: 0 0 25px #f5b45433;
 }
 
+/* Deep-link badges. Inline pills under the body, above the footer. */
+.card .card-links {
+  margin-top: 10px;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.card .card-link {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  color: var(--text-mute);
+  background: #0a0f2cb0;
+  text-decoration: none;
+  /* Override the card's grab cursor — clicking these is a follow,
+     not a drag start. */
+  cursor: pointer;
+}
+.card .card-link:hover {
+  border-color: var(--odin);
+  color: var(--odin-soft);
+  text-decoration: none;
+}
+.card .card-link.primary {
+  border-color: var(--odin);
+  color: var(--odin-soft);
+  background: linear-gradient(180deg, #1c2766aa, #0a0f2cea);
+}
+
 .card .footer {
   margin-top: 10px;
   display: flex;

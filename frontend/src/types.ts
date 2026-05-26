@@ -23,6 +23,14 @@ export interface Manifest {
   depends_on?:       string[];
   notes?:            string;
 
+  // Deep-link affordances (Odin v2.1). Both optional — cards
+  // without either still render fine, just without the linking
+  // badges. `project_dir` is auto-populated by the CLI from $PWD
+  // on push; `claude_url` is whatever explicit URL the user pastes
+  // into the manifest (typically a `/rc` Remote Control URL).
+  project_dir?:      string;
+  claude_url?:       string;
+
   // Server-populated
   board_id?:         string;
   received_at?:      string;

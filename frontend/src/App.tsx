@@ -754,10 +754,93 @@ function SessionCard({
       {m.blocked_on_user && m.blocked_reason ? (
         <div className="blocked-banner">{m.blocked_reason}</div>
       ) : null}
+      <DeepLinks manifest={m} />
       <div className="footer">
         <span>ring {ringFor(m)}</span>
         <span>{relativeTime(m.updated_at)}</span>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Per-card deep-link badges. Three possible affordances, all optional:
+ *
+ *   • An explicit ↗ link to whatever URL the user set via `claude_url`
+ *     in the manifest. Typically a Remote Control session URL pasted
+ *     after running `/rc` — opens the running session directly on iOS
+ *     via the Claude app, or in claude.ai web. Wins when present.
+ *
+ *   • An "Open in Claude Code" badge that fires the macOS deep-link
+ *     scheme `claude-cli://open?cwd=…&q=Resume <chapter>`. Opens the
+ *     Claude Code app in the right project with a one-line resume
+ *     prompt. Not a true session-resume — Claude Code doesn't expose
+ *     that yet (Anthropic issues #47018 / #25642) — but the closest
+ *     approximation given current platform constraints.
+ *
+ *   • An "Open on claude.ai" badge linking to the global
+ *     https://claude.ai/code list. Works in any browser including
+ *     iOS / iPad Safari; the user finds the session by name from the
+ *     Remote-Control list. The catch-all.
+ *
+ * Click handlers stopPropagation so the drag handler on the card
+ * body doesn't fire when the user is trying to follow a link.
+ */
+function DeepLinks({ manifest: m }: { manifest: Manifest }): JSX.Element | null {
+  const stop = (e: React.MouseEvent | React.PointerEvent) => e.stopPropagation();
+
+  // If the user set an explicit claude_url, that's authoritative.
+  // Render only it — extra badges would just compete.
+  if (m.claude_url) {
+    return (
+      <div className="card-links">
+        <a className="card-link primary" href={m.claude_url}
+           onClick={stop} onPointerDown={stop}
+           target="_blank" rel="noreferrer"
+           title="Open the explicit Claude URL set on this manifest">
+          ↗ open in claude
+        </a>
+      </div>
+    );
+  }
+
+  const dir = m.project_dir;
+  const chapter = m.current_chapter || "session";
+  // claude-cli://open takes either `cwd=` (absolute path) or
+  // `repo=owner/name`. We have the path; the chapter becomes the
+  // resume prompt the new Claude Code session opens with.
+  const desktopUrl = dir
+    ? `claude-cli://open?cwd=${encodeURIComponent(dir)}&q=${encodeURIComponent(`Resume — ${chapter}`)}`
+    : null;
+  const webUrl = "https://claude.ai/code";
+
+  if (!desktopUrl) {
+    // No project dir → only the catch-all browser link makes sense.
+    return (
+      <div className="card-links">
+        <a className="card-link" href={webUrl}
+           onClick={stop} onPointerDown={stop}
+           target="_blank" rel="noreferrer"
+           title="Open the claude.ai sessions list (any device)">
+          🌐 claude.ai/code
+        </a>
+      </div>
+    );
+  }
+
+  return (
+    <div className="card-links">
+      <a className="card-link" href={desktopUrl}
+         onClick={stop} onPointerDown={stop}
+         title={`Open Claude Code in ${dir}`}>
+        ↗ claude code
+      </a>
+      <a className="card-link" href={webUrl}
+         onClick={stop} onPointerDown={stop}
+         target="_blank" rel="noreferrer"
+         title="Open the claude.ai sessions list (works on iOS / iPad / any browser)">
+        🌐 claude.ai
+      </a>
     </div>
   );
 }

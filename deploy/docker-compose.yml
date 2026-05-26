@@ -64,6 +64,15 @@ networks:
     driver: bridge
 
 volumes:
+  # Pin the absolute volume name so renames of the compose project
+  # (e.g. when we added `name: claude-board` above) don't migrate
+  # us off the data. Without this Docker derives the volume name
+  # from project + key (`<project>_<key>`); changing the project
+  # creates a fresh empty volume and the original data still lives
+  # under the old name. Pinning side-steps that footgun forever.
   claude-board-data:
+    name: claude-board-data
   caddy-data:
+    name: claude-board-caddy-data
   caddy-config:
+    name: claude-board-caddy-config

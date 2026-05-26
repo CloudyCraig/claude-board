@@ -156,10 +156,12 @@ def cmd_push(args: argparse.Namespace) -> int:
             print(f"no manifest dir at {MANIFEST_DIR} — nothing to push")
         return 0
 
-    files = sorted(MANIFEST_DIR.glob("*.json"))
+    # The archive subdirectory is where "done"-and-stale manifests
+    # retire to. We never push from there and we never re-archive
+    # something that's already moved.
+    archive_dir = MANIFEST_DIR / "archive"
+    files = sorted(MANIFEST_DIR.glob("*.json"))   # excludes archive/ subdir
     if args.session_id:
-        # Only push a specific session — useful when a Claude session
-        # wants to push *only its own* manifest in a hook.
         files = [MANIFEST_DIR / f"{args.session_id}.json"]
         if not files[0].exists():
             print(f"no manifest for session_id={args.session_id}", file=sys.stderr)
@@ -168,6 +170,8 @@ def cmd_push(args: argparse.Namespace) -> int:
     server = cfg["server"].rstrip("/")
     pushed = 0
     failed = 0
+    archived = 0
+    now = datetime.now(timezone.utc)
     for f in files:
         try:
             obj = json.loads(f.read_text(encoding="utf-8"))
@@ -180,6 +184,47 @@ def cmd_push(args: argparse.Namespace) -> int:
         obj.pop("received_at", None)
         # Ensure updated_at exists so the server's ORDER BY works.
         obj.setdefault("updated_at", datetime.now(timezone.utc).isoformat(timespec="seconds"))
+        # Auto-fill project_dir from the CLI's CWD if the manifest
+        # doesn't carry one. This is what the board uses to build
+        # the `claude-cli://open?cwd=…` deep-link badge on the card.
+        # The Stop hook runs `claude-board push` from wherever the
+        # Claude session is running, so $PWD is the session's
+        # project directory — exactly what we want. Manifests that
+        # set project_dir explicitly are left alone.
+        if not obj.get("project_dir"):
+            try:
+                obj["project_dir"] = os.path.realpath(os.getcwd())
+            except OSError:
+                pass
+
+        # Auto-archive: a manifest marked "done" gets a grace period
+        # on the board (so the user sees the final state), then we
+        # quietly delete it from the server and move the local file
+        # into archive/ so the next push doesn't resurrect it. The
+        # grace period is short by default (1 h) — long enough for a
+        # post-completion glance, short enough that the board stops
+        # being a graveyard. Override with --prune-after-hours / 0
+        # for immediate or large number to retain longer.
+        if obj.get("status") == "done" and not args.no_archive:
+            try:
+                done_age_hours = (now - datetime.fromisoformat(obj["updated_at"])).total_seconds() / 3600
+            except (ValueError, TypeError):
+                done_age_hours = 0
+            if done_age_hours >= args.prune_after_hours:
+                # Delete from server (best-effort), then move locally.
+                _request("DELETE",
+                         f"{server}/api/manifests/{obj['session_id']}",
+                         token=cfg["token"])
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    f.rename(archive_dir / f.name)
+                    archived += 1
+                    if args.verbose:
+                        print(f"  arch {f.name}  done {done_age_hours:.1f}h ago — archived")
+                except OSError as e:
+                    print(f"  warn {f.name}: couldn't archive ({e})", file=sys.stderr)
+                continue
+
         status, body = _request(
             "POST", f"{server}/api/manifests",
             token=cfg["token"], body=obj,
@@ -192,8 +237,76 @@ def cmd_push(args: argparse.Namespace) -> int:
         if args.verbose:
             print(f"  ok   {f.name}  {obj.get('status','?')}  {obj.get('title','')[:60]}")
 
-    print(f"pushed={pushed} failed={failed}")
+    summary = f"pushed={pushed} failed={failed}"
+    if archived:
+        summary += f" archived={archived}"
+    print(summary)
     return 0 if failed == 0 else 2
+
+
+def _resolve_session_id(arg_session_id: str | None) -> Path | None:
+    """Pick the manifest file to operate on. Explicit --session-id wins;
+    otherwise we pick the *most recently modified* manifest in the dir
+    that isn't archived. This is "the session you're currently in"
+    from the CLI's POV — good enough for block/unblock convenience."""
+    if arg_session_id:
+        p = MANIFEST_DIR / f"{arg_session_id}.json"
+        return p if p.exists() else None
+    candidates = sorted(
+        (p for p in MANIFEST_DIR.glob("*.json") if p.is_file()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def _update_manifest(path: Path, patch: dict[str, Any]) -> None:
+    """Read-modify-write one manifest, stamping a fresh updated_at."""
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    obj.update(patch)
+    obj["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    path.write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8")
+
+
+def cmd_block(args: argparse.Namespace) -> int:
+    """Flip the current session's manifest to blocked-on-user. Use this
+    whenever a turn ends with a question to the user — even when the
+    question is plain chat rather than AskUserQuestion. The Stop hook
+    pushes the updated manifest immediately so the board's 'NEEDS YOU'
+    indicator goes up before the user even reads the message."""
+    p = _resolve_session_id(args.session_id)
+    if p is None:
+        print("no manifest to block — pass --session-id or create one first", file=sys.stderr)
+        return 1
+    reason = (args.reason or "").strip()[:120]
+    _update_manifest(p, {"blocked_on_user": True, "blocked_reason": reason})
+    print(f"blocked {p.stem}  reason={reason or '(none)'}")
+    return 0
+
+
+def cmd_unblock(args: argparse.Namespace) -> int:
+    """Clear blocked-on-user for the current session. Run this when the
+    user responds and you're picking the turn back up."""
+    p = _resolve_session_id(args.session_id)
+    if p is None:
+        print("no manifest to unblock", file=sys.stderr)
+        return 1
+    _update_manifest(p, {"blocked_on_user": False, "blocked_reason": ""})
+    print(f"unblocked {p.stem}")
+    return 0
+
+
+def cmd_chapter(args: argparse.Namespace) -> int:
+    """Set current_chapter on the current session. Handy when you mark
+    a new chapter via the IDE skill — call this in the same breath so
+    the board's headline tracks what you're actually doing now."""
+    p = _resolve_session_id(args.session_id)
+    if p is None:
+        print("no manifest to update", file=sys.stderr)
+        return 1
+    _update_manifest(p, {"current_chapter": args.text[:200]})
+    print(f"chapter {p.stem}  → {args.text[:80]}")
+    return 0
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
@@ -258,7 +371,29 @@ def main(argv: list[str] | None = None) -> int:
     p_push = sub.add_parser("push", help="POST local manifests to the server.")
     p_push.add_argument("--session-id", default=None, help="Push only this session's manifest")
     p_push.add_argument("-v", "--verbose", action="store_true")
+    p_push.add_argument("--no-archive", action="store_true",
+                        help="Don't auto-archive done manifests (default: archive after grace)")
+    p_push.add_argument("--prune-after-hours", type=float, default=1.0,
+                        help="Hours a 'done' manifest stays on the board before auto-archive (default: 1)")
     p_push.set_defaults(func=cmd_push)
+
+    # block / unblock / chapter — small helpers a Claude session calls
+    # mid-turn to keep the board honest without me hand-editing JSON.
+    p_block = sub.add_parser("block", help="Mark the current session blocked-on-user.")
+    p_block.add_argument("--session-id", default=None,
+                         help="Session to update (default: most recently modified)")
+    p_block.add_argument("--reason", default="",
+                         help="Short reason shown on the card (≤120 chars)")
+    p_block.set_defaults(func=cmd_block)
+
+    p_unblock = sub.add_parser("unblock", help="Clear blocked-on-user for the current session.")
+    p_unblock.add_argument("--session-id", default=None)
+    p_unblock.set_defaults(func=cmd_unblock)
+
+    p_chapter = sub.add_parser("chapter", help="Set current_chapter on the current session.")
+    p_chapter.add_argument("text", help="The chapter title")
+    p_chapter.add_argument("--session-id", default=None)
+    p_chapter.set_defaults(func=cmd_chapter)
 
     p_watch = sub.add_parser("watch", help="Watch ~/.claude-board/ and push on changes.")
     p_watch.add_argument("--interval", default=5, type=int, help="Poll interval seconds (default 5)")
