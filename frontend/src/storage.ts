@@ -37,36 +37,3 @@ export function boardIdFromPath(): string | null {
   const m = window.location.pathname.match(/^\/b\/([A-Za-z0-9_-]+)\/?$/);
   return m ? m[1] : null;
 }
-
-// ----- layout overrides (drag-to-rearrange persistence) -----
-//
-// When the user drags a card on the stage we remember its position
-// in localStorage so a refresh / page reload keeps it where they put
-// it. Stored per-board so dragging cards on one board doesn't move
-// equally-named cards on another. Keys are session_id; values are
-// {x, y} in stage-pixel coordinates of the card's CENTRE.
-
-const LAYOUT_PREFIX = "claude-board.layout.";
-
-export type LayoutOverrides = Record<string, { x: number; y: number }>;
-
-export function loadLayout(boardId: string): LayoutOverrides {
-  try {
-    const raw = localStorage.getItem(LAYOUT_PREFIX + boardId);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    return (parsed && typeof parsed === "object") ? parsed as LayoutOverrides : {};
-  } catch {
-    return {};
-  }
-}
-
-export function saveLayout(boardId: string, overrides: LayoutOverrides): void {
-  try {
-    localStorage.setItem(LAYOUT_PREFIX + boardId, JSON.stringify(overrides));
-  } catch { /* private mode / quota — silent */ }
-}
-
-export function clearLayout(boardId: string): void {
-  try { localStorage.removeItem(LAYOUT_PREFIX + boardId); } catch { /**/ }
-}

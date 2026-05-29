@@ -63,8 +63,13 @@ DB_PATH        = Path(os.environ.get("BOARD_DB_PATH", "/var/lib/claude-board/boa
 STATIC_DIR     = Path(os.environ.get("BOARD_STATIC_DIR", "/srv/claude-board/static"))
 LISTEN_HOST    = os.environ.get("BOARD_HOST", "0.0.0.0")
 LISTEN_PORT    = int(os.environ.get("BOARD_PORT", "8200"))
-# Sessions older than this with no updates are pruned from disk daily.
-PRUNE_AFTER_DAYS = int(os.environ.get("BOARD_PRUNE_DAYS", "60"))
+# A live session untouched for this long is treated as dead and moved
+# off the board into the archives table. Non-destructive: history is
+# kept and a later push (the session resuming) resurrects the live
+# card, so the threshold can be generous without risking active work.
+STALE_ARCHIVE_HOURS = int(os.environ.get("BOARD_STALE_ARCHIVE_HOURS", "24"))
+# How often the pruner sweeps for stale sessions.
+PRUNE_INTERVAL_SECONDS = int(os.environ.get("BOARD_PRUNE_INTERVAL_SECONDS", "900"))
 
 # Cookie session secret — used by itsdangerous to sign session-id
 # cookies. MUST be set in production via env. In dev (no env var) we
@@ -537,21 +542,66 @@ async def lifespan(_: FastAPI):
         prune_task.cancel()
 
 
+def _archive_stale_manifests(conn: sqlite3.Connection, cutoff_iso: str) -> list[str]:
+    """Move every live manifest untouched since `cutoff_iso` into the
+    archives table. Non-destructive: manifest_history is left in place
+    and a later push of the same session re-creates the live row, so an
+    actually-resuming session reappears on its own. Returns the distinct
+    board_ids that lost at least one card (so the caller can wake their
+    SSE subscribers).
+
+    Mirrors `_archive_session_now` (which is a per-session closure in
+    _build_app); this is the batch, prune-loop variant. One IMMEDIATE
+    transaction so a crash can't half-archive."""
+    archived_at = _now_iso()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        rows = conn.execute(
+            "SELECT board_id, session_id, payload FROM manifests WHERE updated_at < ?",
+            (cutoff_iso,),
+        ).fetchall()
+        for r in rows:
+            count = conn.execute(
+                "SELECT COUNT(*) AS n FROM manifest_history WHERE board_id = ? AND session_id = ?",
+                (r["board_id"], r["session_id"]),
+            ).fetchone()["n"]
+            conn.execute(
+                """
+                INSERT INTO archives (board_id, session_id, final_payload, archived_at, push_count)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(board_id, session_id) DO UPDATE SET
+                    final_payload = excluded.final_payload,
+                    archived_at   = excluded.archived_at,
+                    push_count    = excluded.push_count
+                """,
+                (r["board_id"], r["session_id"], r["payload"], archived_at, count),
+            )
+        conn.execute(
+            "DELETE FROM manifests WHERE updated_at < ?",
+            (cutoff_iso,),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return sorted({r["board_id"] for r in rows})
+
+
 async def _prune_loop() -> None:
     while True:
         try:
             with _open_db() as conn:
-                cutoff = (datetime.now(timezone.utc).timestamp() - PRUNE_AFTER_DAYS * 86400)
+                cutoff = datetime.now(timezone.utc).timestamp() - STALE_ARCHIVE_HOURS * 3600
                 cutoff_iso = datetime.fromtimestamp(cutoff, tz=timezone.utc).isoformat(timespec="seconds")
-                cur = conn.execute(
-                    "DELETE FROM manifests WHERE updated_at < ?",
-                    (cutoff_iso,),
-                )
-                if cur.rowcount:
-                    logger.info("pruned %d stale manifests (older than %dd)", cur.rowcount, PRUNE_AFTER_DAYS)
+                affected = _archive_stale_manifests(conn, cutoff_iso)
+            if affected:
+                logger.info("auto-archived stale manifests on %d board(s) (untouched >%dh)",
+                            len(affected), STALE_ARCHIVE_HOURS)
+                for board_id in affected:
+                    PUBSUB.publish(board_id, "archive")
         except Exception:  # noqa: BLE001
             logger.exception("prune loop failed; continuing")
-        await asyncio.sleep(3600)
+        await asyncio.sleep(PRUNE_INTERVAL_SECONDS)
 
 
 def _build_app() -> FastAPI:

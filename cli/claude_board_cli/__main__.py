@@ -554,23 +554,50 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
     ))
 
 
-def _session_id_from_hook_stdin() -> str | None:
-    """Read the SessionStart / Stop / UserPromptSubmit hook payload from
-    stdin and pull out `session_id`. Returns None silently if stdin is
-    empty, not JSON, or doesn't carry that field — every caller wants
-    the same fallback (resolve by most-recent-mtime) when this happens,
-    and a broken hook must not crash a session."""
+def _hook_payload_from_stdin() -> dict[str, Any]:
+    """Read and parse the hook JSON on stdin. Returns {} silently on any
+    problem (tty, empty stdin, not JSON) — a broken hook must never
+    crash a session. stdin can only be read once per process, so callers
+    that need more than session_id (e.g. the prompt text) go through
+    this rather than reading stdin twice."""
     try:
         if sys.stdin.isatty():
-            return None
+            return {}
         raw = sys.stdin.read()
         if not raw.strip():
-            return None
+            return {}
         obj = json.loads(raw)
-        sid = (obj.get("session_id") or "").strip()
-        return sid or None
+        return obj if isinstance(obj, dict) else {}
     except (json.JSONDecodeError, OSError, ValueError):
+        return {}
+
+
+def _session_id_from_hook_stdin() -> str | None:
+    """Pull `session_id` out of the hook payload. Returns None silently
+    when absent — every caller wants the same fallback (resolve by
+    most-recent-mtime) in that case."""
+    sid = (_hook_payload_from_stdin().get("session_id") or "").strip()
+    return sid or None
+
+
+# Titles the auto-title path is allowed to overwrite. Anything else is
+# a real title Claude set, and we never clobber it.
+_PLACEHOLDER_TITLES = {"", "new session"}
+
+
+def _derive_title(prompt: str) -> str | None:
+    """Turn the first user prompt into a concise card title: first
+    non-blank line, internal whitespace collapsed, trimmed to ~60 chars.
+    Returns None if there's nothing usable."""
+    if not prompt:
         return None
+    line = next((ln.strip() for ln in prompt.splitlines() if ln.strip()), "")
+    if not line:
+        return None
+    line = " ".join(line.split())
+    if len(line) > 60:
+        line = line[:57].rstrip() + "…"
+    return line
 
 
 def cmd_hook_stop(args: argparse.Namespace) -> int:
@@ -597,11 +624,34 @@ def cmd_hook_stop(args: argparse.Namespace) -> int:
 
 
 def cmd_hook_prompt(args: argparse.Namespace) -> int:
-    """User-just-submitted hook entry point. Mirror of hook-stop:
-    consume stdin, unblock the matching session, push it. Same stdin-
-    is-missing fallback semantics."""
-    sid = _session_id_from_hook_stdin()
+    """User-just-submitted hook entry point. Consume stdin, unblock the
+    matching session, auto-title it from the first prompt if it's still
+    a placeholder, then push. Same stdin-is-missing fallback semantics."""
+    payload = _hook_payload_from_stdin()
+    sid = (payload.get("session_id") or "").strip() or None
     cmd_unblock(argparse.Namespace(session_id=sid))
+
+    # The bootstrap hook wrote a "new session" placeholder before any
+    # prompt existed. The first prompt is the best one-line description
+    # we'll get, so promote it to the title and clear the "starting up"
+    # chapter placeholder. Only fires while the title is still a
+    # placeholder — once Claude sets a real title we never clobber it.
+    p = _resolve_session_id(sid)
+    if p is not None:
+        try:
+            obj = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            obj = None
+        if obj is not None and (obj.get("title") or "").strip().lower() in _PLACEHOLDER_TITLES:
+            title = _derive_title(payload.get("prompt") or "")
+            if title:
+                patch: dict[str, Any] = {"title": title}
+                if (obj.get("current_chapter") or "").strip().lower() == "starting up":
+                    # "" (not None): the server's ManifestPayload types
+                    # current_chapter as a non-optional str, so null 422s.
+                    patch["current_chapter"] = ""
+                _update_manifest(p, patch)
+
     return cmd_push(argparse.Namespace(
         session_id=sid, verbose=args.verbose,
         no_archive=False, prune_after_hours=1.0,

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ArchivesView } from "./Archives";
 import { LoginPage, MyAccountPage, RegisterPage } from "./Auth";
 import {
@@ -7,10 +7,8 @@ import {
   fetchMe, fetchMyBoards, listManifests, listOwnedManifests,
   logoutUser, regenerateBoardToken, subscribePolling,
 } from "./api";
-import { layout, ringFor, type LaidOutCard } from "./Layout";
 import {
-  boardIdFromPath, clearLayout, forgetToken, loadLayout, loadToken,
-  saveLayout, saveToken, type LayoutOverrides,
+  boardIdFromPath, forgetToken, loadToken, saveToken,
 } from "./storage";
 import type { Manifest, StoredBoard, User, UserBoard } from "./types";
 
@@ -593,7 +591,6 @@ function BoardView({ boardId }: { boardId: string }): JSX.Element {
   return (
     <>
       <Board
-        boardId={boardId}
         manifests={manifests}
         onRefresh={() => refreshRef.current()}
         refreshing={refreshing}
@@ -672,12 +669,39 @@ function TokenPrompt({
 
 // ----------------- the stage -----------------
 
+// ----------------- status-column triage -----------------
+
+type ColumnKey = "needs-you" | "active" | "idle" | "done";
+
+// A non-done session that hasn't pushed an update in this long drifts
+// into the "idle" column. The server independently auto-archives it
+// off the board entirely after BOARD_STALE_ARCHIVE_HOURS; this is the
+// gentler, in-board "probably parked" signal that fires much sooner.
+const IDLE_AFTER_MS = 30 * 60 * 1000;
+
+const COLUMNS: { key: ColumnKey; label: string }[] = [
+  { key: "needs-you", label: "needs you" },
+  { key: "active",    label: "active" },
+  { key: "idle",      label: "idle" },
+  { key: "done",      label: "done" },
+];
+
+// Triage bucket for a card. Priority: done wins outright; otherwise a
+// session waiting on the user is "needs you"; otherwise a stale (or
+// self-reported idle) session is "idle"; everything else is active.
+function columnFor(m: Manifest, now: number): ColumnKey {
+  if (m.status === "done") return "done";
+  if (m.blocked_on_user) return "needs-you";
+  const age = now - Date.parse(m.updated_at);
+  if (m.status === "idle" || (Number.isFinite(age) && age > IDLE_AFTER_MS)) return "idle";
+  return "active";
+}
+
 function Board({
-  boardId, manifests, onRefresh, refreshing, lastRefreshed, authMode,
+  manifests, onRefresh, refreshing, lastRefreshed, authMode,
   onDelete, onArchive, onOpenArchives,
   onBoardArchive, onBoardDelete, onBoardRegenerate,
 }: {
-  boardId: string;
   manifests: Manifest[];
   onRefresh: () => void;
   refreshing: boolean;
@@ -690,135 +714,71 @@ function Board({
   onBoardDelete: () => Promise<void>;
   onBoardRegenerate: () => Promise<void>;
 }): JSX.Element {
-  const stageRef = useRef<HTMLDivElement>(null);
-  const [dims, setDims] = useState<{ w: number; h: number }>({ w: 1200, h: 700 });
-
-  // Per-board persistent drag overrides. Override map is session_id
-  // → {x, y} in absolute stage-pixel coordinates of the card centre.
-  const [overrides, setOverrides] = useState<LayoutOverrides>(
-    () => loadLayout(boardId),
-  );
-
-  // The stage resize tracks the container so the polar layout
-  // expands and contracts gracefully. ResizeObserver fires once on
-  // mount + on every parent resize.
+  // Re-render every 30s so a card ages into the "idle" column even when
+  // no fresh manifests arrive between polls.
+  const [, tick] = useState(0);
   useEffect(() => {
-    const el = stageRef.current;
-    if (!el) return;
-    const ro = new ResizeObserver(() => {
-      setDims({ w: el.clientWidth, h: el.clientHeight });
-    });
-    ro.observe(el);
-    return () => ro.disconnect();
+    const id = window.setInterval(() => tick((n) => n + 1), 30_000);
+    return () => window.clearInterval(id);
   }, []);
 
-  // Stable auto-layout. Drag overrides apply on top.
-  const placed = useMemo(() => layout(manifests, dims.w, dims.h), [manifests, dims]);
-
-  // Merge auto-layout with overrides. We don't mutate `placed` — we
-  // produce a fresh array because rendering cares about identity.
-  const positioned = useMemo<LaidOutCard[]>(
-    () => placed.map((c) => {
-      const o = overrides[c.manifest.session_id];
-      return o ? { ...c, x: o.x, y: o.y } : c;
-    }),
-    [placed, overrides],
-  );
-
-  // Build an index from session_id → position so we can draw edges
-  // that follow dragged cards.
-  const positionsBySession = useMemo(() => {
-    const m = new Map<string, LaidOutCard>();
-    for (const p of positioned) m.set(p.manifest.session_id, p);
-    return m;
-  }, [positioned]);
-
-  // Persisted callback so SessionCard doesn't re-mount drag handlers
-  // every render.
-  const commitDrag = useCallback((sessionId: string, x: number, y: number) => {
-    setOverrides((prev) => {
-      const next = { ...prev, [sessionId]: { x, y } };
-      saveLayout(boardId, next);
-      return next;
-    });
-  }, [boardId]);
-
-  const resetLayout = useCallback(() => {
-    clearLayout(boardId);
-    setOverrides({});
-  }, [boardId]);
-
-  const hasOverrides = Object.keys(overrides).length > 0;
-
-  if (manifests.length === 0) {
-    return (
-      <main className="board">
-        <div className="stage" ref={stageRef}>
-          <StageToolbar
-            onRefresh={onRefresh} refreshing={refreshing} lastRefreshed={lastRefreshed}
-            onResetLayout={resetLayout} hasOverrides={hasOverrides}
-            authMode={authMode}
-            onOpenArchives={onOpenArchives}
-            onBoardArchive={onBoardArchive}
-            onBoardDelete={onBoardDelete}
-            onBoardRegenerate={onBoardRegenerate}
-          />
-          <div className="odin-centre">
-            <img src="/odin.png" alt="Odin" />
-            <div className="label">no sessions yet · push a manifest to begin</div>
-          </div>
-        </div>
-      </main>
-    );
+  // Bucket + sort. Cheap for a board's worth of cards, so we just do it
+  // each render rather than memoising (the 30s tick has to invalidate
+  // it anyway, since `now` advances).
+  const now = Date.now();
+  const grouped: Record<ColumnKey, Manifest[]> =
+    { "needs-you": [], active: [], idle: [], done: [] };
+  for (const m of manifests) grouped[columnFor(m, now)].push(m);
+  for (const k of Object.keys(grouped) as ColumnKey[]) {
+    grouped[k].sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
   }
 
   return (
-    <main className="board">
-      <div className="stage" ref={stageRef}>
+    <main className="board columns-view">
+      <div className="stage">
         <StageToolbar
           onRefresh={onRefresh} refreshing={refreshing} lastRefreshed={lastRefreshed}
-          onResetLayout={resetLayout} hasOverrides={hasOverrides}
           authMode={authMode}
           onOpenArchives={onOpenArchives}
           onBoardArchive={onBoardArchive}
           onBoardDelete={onBoardDelete}
           onBoardRegenerate={onBoardRegenerate}
         />
-        <div className="odin-centre">
-          <img src="/odin.png" alt="Odin" />
+        <div className="board-watermark" aria-hidden="true">
+          <img src="/odin.png" alt="" />
           <div className="label">heimdall stands the watch</div>
         </div>
 
-        {/* Dependency edges live on an SVG behind the cards. */}
-        <svg className="edges" width={dims.w} height={dims.h}>
-          {positioned.flatMap((p) =>
-            (p.manifest.depends_on ?? []).map((dep, i) => {
-              const other = positionsBySession.get(dep);
-              if (!other) return null;
-              // Curve through the centre area so edges feel like
-              // they radiate from Odin rather than crossing him.
-              const mx = (p.x + other.x) / 2;
-              const my = (p.y + other.y) / 2;
-              const ctrlX = mx + (mx - dims.w / 2) * -0.3;
-              const ctrlY = my + (my - dims.h / 2) * -0.3;
-              const d = `M ${p.x} ${p.y} Q ${ctrlX} ${ctrlY} ${other.x} ${other.y}`;
-              const isBlocked = p.manifest.status === "blocked";
-              return <path key={`${p.manifest.session_id}-${dep}-${i}`} d={d} className={isBlocked ? "blocked" : ""} />;
-            }),
-          )}
-        </svg>
-
-        {positioned.map((p) => (
-          <SessionCard
-            key={p.manifest.session_id}
-            card={p}
-            stageRef={stageRef}
-            overridden={!!overrides[p.manifest.session_id]}
-            onDragEnd={(x, y) => commitDrag(p.manifest.session_id, x, y)}
-            onDelete={() => onDelete(p.manifest.session_id)}
-            onArchive={() => onArchive(p.manifest.session_id)}
-          />
-        ))}
+        {manifests.length === 0 ? (
+          <div className="empty">
+            <div>no sessions yet</div>
+            <div className="hint">push a manifest to begin</div>
+          </div>
+        ) : (
+          <div className="columns">
+            {COLUMNS.map((col) => (
+              <section className={`column column-${col.key}`} key={col.key}>
+                <header className="column-head">
+                  <span className="column-label">{col.label}</span>
+                  <span className="column-count">{grouped[col.key].length}</span>
+                </header>
+                <div className="column-body">
+                  {grouped[col.key].map((m) => (
+                    <SessionCard
+                      key={m.session_id}
+                      manifest={m}
+                      onDelete={() => onDelete(m.session_id)}
+                      onArchive={() => onArchive(m.session_id)}
+                    />
+                  ))}
+                  {grouped[col.key].length === 0 ? (
+                    <div className="column-empty">—</div>
+                  ) : null}
+                </div>
+              </section>
+            ))}
+          </div>
+        )}
       </div>
     </main>
   );
@@ -827,14 +787,12 @@ function Board({
 // ----------------- toolbar (refresh + reset layout) -----------------
 
 function StageToolbar({
-  onRefresh, refreshing, lastRefreshed, onResetLayout, hasOverrides, authMode, onOpenArchives,
+  onRefresh, refreshing, lastRefreshed, authMode, onOpenArchives,
   onBoardArchive, onBoardDelete, onBoardRegenerate,
 }: {
   onRefresh: () => void;
   refreshing: boolean;
   lastRefreshed: number;
-  onResetLayout: () => void;
-  hasOverrides: boolean;
   authMode: "cookie" | "token";
   onOpenArchives: () => void;
   onBoardArchive: () => Promise<void>;
@@ -883,15 +841,6 @@ function StageToolbar({
       >
         📂 archives
       </button>
-      {hasOverrides ? (
-        <button
-          className="ghost"
-          onClick={onResetLayout}
-          title="Snap every card back to its auto-layout position"
-        >
-          reset layout
-        </button>
-      ) : null}
       {/* Board-level management. Only meaningful for signed-in
           owners — the server's archive/delete/regenerate endpoints
           are cookie-auth. Token-mode users (anonymous bearer) see
@@ -979,85 +928,20 @@ function BoardActionsMenu({
   );
 }
 
-// ----------------- card (with drag) -----------------
+// ----------------- card -----------------
 
 function SessionCard({
-  card, stageRef, overridden, onDragEnd, onDelete, onArchive,
+  manifest: m, onDelete, onArchive,
 }: {
-  card: LaidOutCard;
-  stageRef: React.RefObject<HTMLDivElement>;
-  overridden: boolean;
-  onDragEnd: (x: number, y: number) => void;
+  manifest: Manifest;
   onDelete: () => Promise<void>;
   onArchive: () => Promise<void>;
 }): JSX.Element {
-  const m = card.manifest;
-  const cardRef = useRef<HTMLDivElement>(null);
-
-  // Drag state. We use pointer events so this works on touch + mouse
-  // out of the box, including the trackpad on the Heimdall Claude
-  // Control desktop window.
-  //
-  // Position-during-drag is kept in component state (so motion is
-  // smooth) and only committed to the parent on pointerup (so we
-  // don't thrash localStorage on every pixel).
-  const [dragPos, setDragPos] = useState<{ x: number; y: number } | null>(null);
-  const dragOffset = useRef<{ dx: number; dy: number } | null>(null);
-
-  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>): void => {
-    // Only respond to primary button; ignore right-click etc.
-    if (e.button !== 0) return;
-    const el = cardRef.current;
-    const stage = stageRef.current;
-    if (!el || !stage) return;
-    const stageBox = stage.getBoundingClientRect();
-    // Centre of the card relative to the stage.
-    const cx = e.clientX - stageBox.left;
-    const cy = e.clientY - stageBox.top;
-    dragOffset.current = { dx: cx - card.x, dy: cy - card.y };
-    el.setPointerCapture(e.pointerId);
-    setDragPos({ x: card.x, y: card.y });
-    e.preventDefault();
-  };
-
-  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>): void => {
-    if (!dragOffset.current) return;
-    const stage = stageRef.current;
-    if (!stage) return;
-    const stageBox = stage.getBoundingClientRect();
-    const cx = e.clientX - stageBox.left;
-    const cy = e.clientY - stageBox.top;
-    // Half-card padding so a card can't drift fully off the stage.
-    const padX = 140 + 6;
-    const padY = 85 + 6;
-    const x = Math.max(padX, Math.min(stage.clientWidth  - padX, cx - dragOffset.current.dx));
-    const y = Math.max(padY, Math.min(stage.clientHeight - padY, cy - dragOffset.current.dy));
-    setDragPos({ x, y });
-  };
-
-  const onPointerUp = (e: React.PointerEvent<HTMLDivElement>): void => {
-    if (!dragOffset.current || !dragPos) return;
-    const el = cardRef.current;
-    if (el && el.hasPointerCapture(e.pointerId)) {
-      el.releasePointerCapture(e.pointerId);
-    }
-    dragOffset.current = null;
-    onDragEnd(dragPos.x, dragPos.y);
-    setDragPos(null);
-  };
-
-  const onDoubleClick = (): void => {
-    // Convenience: double-click resets just this card (only if it
-    // has been dragged). Plain click stays free for future select-
-    // a-card affordances.
-    if (overridden) onDragEnd(card.x, card.y);   // parent will replace, but…
-  };
-
   // Delete affordance. Confirm-gated because there's no undo path on
   // the server side — once deleted, the manifest is gone (the local
   // ~/.claude-board/<id>.json is left alone; only the server row
   // disappears, so a subsequent `push` would re-create the card).
-  const onDeleteClick = async (e: React.MouseEvent | React.PointerEvent): Promise<void> => {
+  const onDeleteClick = async (e: React.MouseEvent): Promise<void> => {
     e.stopPropagation();
     const label = m.title || m.session_id;
     if (!window.confirm(`Delete "${label}" from the board?\n\nThis nukes the live card AND all push history for replay. The local manifest at ~/.claude-board/${m.session_id}.json is left alone; a subsequent push would re-create the card from scratch.`)) return;
@@ -1072,7 +956,7 @@ function SessionCard({
   // history on the server — the session vanishes from the live board
   // but the user can find it in the archives view and scrub through
   // every push that led to its final state.
-  const onArchiveClick = async (e: React.MouseEvent | React.PointerEvent): Promise<void> => {
+  const onArchiveClick = async (e: React.MouseEvent): Promise<void> => {
     e.stopPropagation();
     try {
       await onArchive();
@@ -1096,37 +980,16 @@ function SessionCard({
     return <span key={t.id} className={`pip ${cls}`} title={`${t.status}: ${t.title}`} />;
   });
 
-  // Position: drag-in-progress overrides everything else.
-  const x = dragPos ? dragPos.x : card.x;
-  const y = dragPos ? dragPos.y : card.y;
-  const dragging = dragPos !== null;
-
-  const cls = [
-    "card",
-    m.blocked_on_user ? "blocked-on-user" : "",
-    dragging         ? "dragging"         : "",
-    overridden       ? "overridden"       : "",
-  ].filter(Boolean).join(" ");
+  const cls = ["card", m.blocked_on_user ? "blocked-on-user" : ""].filter(Boolean).join(" ");
 
   return (
-    <div
-      ref={cardRef}
-      className={cls}
-      style={{ left: x, top: y }}
-      onPointerDown={onPointerDown}
-      onPointerMove={onPointerMove}
-      onPointerUp={onPointerUp}
-      onPointerCancel={onPointerUp}
-      onDoubleClick={onDoubleClick}
-      title={overridden ? "Drag to move · double-click to snap back" : "Drag to move"}
-    >
+    <div className={cls}>
       <div className="head">
         <div className="title" title={m.title}>{m.title || "(untitled)"}</div>
         <span className={`chip ${chipClass}`}>{chipLabel}</span>
         <button
           type="button"
           className="card-arch"
-          onPointerDown={(e) => e.stopPropagation()}
           onClick={onArchiveClick}
           aria-label="Archive this session"
           title="Archive this session — moves it to the archives view with full replay history"
@@ -1134,7 +997,6 @@ function SessionCard({
         <button
           type="button"
           className="card-del"
-          onPointerDown={(e) => e.stopPropagation()}
           onClick={onDeleteClick}
           aria-label="Delete this session"
           title="Delete this session permanently (no replay history kept)"
@@ -1148,7 +1010,7 @@ function SessionCard({
       ) : null}
       <DeepLinks manifest={m} />
       <div className="footer">
-        <span>ring {ringFor(m)}</span>
+        <span className="mono">{m.session_id.slice(0, 8)}</span>
         <span>{relativeTime(m.updated_at)}</span>
       </div>
     </div>
